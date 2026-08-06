@@ -130,12 +130,180 @@ function showToast(message, type = 'info', duration = 3000) {
     setTimeout(() => toast.remove(), duration);
 }
 
+// ===== Debug Panel =====
+function debugLog(level, ...args) {
+    if (window.DebugPanel) window.DebugPanel.log(level, args);
+}
+
+const DebugPanel = {
+    MAX_LOGS: 400,
+
+    init() {
+        this.panel = document.getElementById('debug-panel');
+        this.logEl = document.getElementById('debug-log');
+        this.statusEl = document.getElementById('debug-status');
+        this.logs = [];
+
+        document.getElementById('btn-debug-toggle').addEventListener('click', () => this.toggle());
+        document.getElementById('btn-debug-close').addEventListener('click', () => this.close());
+        document.getElementById('btn-debug-clear').addEventListener('click', () => this.clear());
+        document.getElementById('btn-debug-copy').addEventListener('click', () => this.copyLogs());
+        document.getElementById('btn-debug-reconnect').addEventListener('click', () => this.reconnect());
+
+        this.hookConsole();
+        this.hookErrors();
+        this.log('info', ['Debug panel khởi động. Bấm 📋 để copy log báo lỗi.']);
+
+        setInterval(() => {
+            if (this.panel.classList.contains('open')) this.refreshStatus();
+        }, 1500);
+    },
+
+    toggle() {
+        this.panel.classList.toggle('open');
+        if (this.panel.classList.contains('open')) this.refreshStatus();
+    },
+
+    close() {
+        this.panel.classList.remove('open');
+    },
+
+    clear() {
+        this.logs = [];
+        this.logEl.innerHTML = '';
+    },
+
+    log(level, args) {
+        const text = args.map(a => {
+            if (typeof a === 'string') return a;
+            if (a instanceof Error) return a.stack || a.message;
+            try {
+                return JSON.stringify(a);
+            } catch (e) {
+                return String(a);
+            }
+        }).join(' ');
+
+        const time = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+        this.logs.push({ level, time, text });
+        if (this.logs.length > this.MAX_LOGS) this.logs.shift();
+
+        const line = document.createElement('div');
+        line.className = `dbg-line dbg-${level}`;
+        line.innerHTML = `<span class="dbg-time">${time}</span> ${this.escapeHtml(text)}`;
+        this.logEl.appendChild(line);
+        while (this.logEl.children.length > this.MAX_LOGS) this.logEl.firstChild.remove();
+        this.logEl.scrollTop = this.logEl.scrollHeight;
+    },
+
+    escapeHtml(str) {
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    },
+
+    hookConsole() {
+        const self = this;
+        const orig = {};
+        ['log', 'info', 'warn', 'error'].forEach(level => {
+            orig[level] = console[level].bind(console);
+            console[level] = (...args) => {
+                orig[level](...args);
+                self.log(level, args);
+            };
+        });
+        this._origConsole = orig;
+    },
+
+    hookErrors() {
+        window.addEventListener('error', (e) => {
+            this.log('error', [e.message, (e.filename || '') + ':' + (e.lineno || '')]);
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+            this.log('error', ['Unhandled promise rejection:', e.reason && e.reason.message || e.reason]);
+        });
+    },
+
+    refreshStatus() {
+        const g = window.game;
+        if (!g) {
+            this.statusEl.textContent = 'Game chưa khởi tạo';
+            return;
+        }
+
+        const lines = [];
+        try {
+            lines.push(`Role: ${g.isHost ? 'Host' : (g.myColor ? 'Guest' : 'Idle')} | Color: ${g.myColor || '-'}`);
+            lines.push(`PeerID: ${g.myId || '-'}`);
+            if (g.peer) {
+                lines.push(`Peer: ${g.peer.destroyed ? 'destroyed' : (g.peer.disconnected ? 'disconnected' : 'open')}`);
+            } else {
+                lines.push('Peer: none');
+            }
+            if (g.conn) {
+                const c = g.conn;
+                lines.push(`Conn: ${c.open ? 'open' : 'connecting/closed'} → ${c.peer || '-'}`);
+                const pc = c.peerConnection || c._pc;
+                if (pc) {
+                    lines.push(`ICE: ${pc.iceConnectionState} | SDP: ${pc.signalingState} | Gathering: ${pc.iceGatheringState}`);
+                } else {
+                    lines.push('ICE: n/a (chưa có RTCPeerConnection)');
+                }
+            } else {
+                lines.push('Conn: none');
+            }
+        } catch (err) {
+            lines.push('Lỗi đọc trạng thái: ' + err.message);
+        }
+        this.statusEl.innerHTML = lines.map(l => `<div>${this.escapeHtml(l)}</div>`).join('');
+    },
+
+    copyLogs() {
+        const text = this.logs.map(l => `[${l.time}] [${l.level}] ${l.text}`).join('\n');
+        const doCopy = () => {
+            navigator.clipboard.writeText(text).then(() => {
+                this.log('info', ['Đã copy logs vào clipboard']);
+            });
+        };
+        if (navigator.clipboard && window.isSecureContext) {
+            doCopy();
+        } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            try {
+                document.execCommand('copy');
+                this.log('info', ['Đã copy logs vào clipboard']);
+            } catch (e) {
+                this.log('error', ['Không copy được, tự bôi đen log trong panel']);
+            }
+            ta.remove();
+        }
+    },
+
+    reconnect() {
+        const g = window.game;
+        if (!g || !g.peer) {
+            this.log('error', ['Chưa có peer (chưa tạo/join phòng)']);
+            return;
+        }
+        if (g.peer.destroyed) {
+            this.log('error', ['Peer đã bị destroy, không reconnect được. Cần tạo phòng mới.']);
+        } else if (g.peer.disconnected) {
+            g.peer.reconnect();
+            this.log('info', ['Đang reconnect peer...']);
+        } else {
+            this.log('info', ['Peer vẫn open, không cần reconnect']);
+        }
+    }
+};
+
 // ===== Main Game Class =====
 class PChessGame {
     constructor() {
         this.chess = new Chess();
         this.peer = null;
         this.conn = null;
+        this.connOpen = false;
         this.myId = null;
         this.roomId = null;
         this.isHost = false;
@@ -273,29 +441,33 @@ class PChessGame {
     setupPeer() {
         return new Promise((resolve, reject) => {
             try {
+                debugLog('info', 'Tạo PeerJS với config', CONFIG.PEER_CONFIG);
                 this.peer = new Peer(CONFIG.PEER_CONFIG);
 
                 this.peer.on('open', (id) => {
                     this.myId = id;
-                    console.log('PeerJS connected:', id);
+                    debugLog('info', 'PeerJS open, ID =', id);
                     resolve(id);
                 });
 
                 this.peer.on('connection', (conn) => {
+                    debugLog('info', 'Có kết nối đến từ', conn.peer);
                     this.handleConnection(conn);
                 });
 
                 this.peer.on('error', (err) => {
-                    console.error('PeerJS error:', err);
+                    debugLog('error', 'PeerJS error:', err.type, err.message);
                     showToast('Lỗi kết nối: ' + err.message, 'error');
                     reject(err);
                 });
 
                 this.peer.on('disconnected', () => {
+                    debugLog('warn', 'Peer bị disconnected, thử reconnect...');
                     showToast('Mất kết nối, đang thử kết nối lại...', 'warning');
                     this.attemptReconnect();
                 });
             } catch (err) {
+                debugLog('error', 'setupPeer exception:', err);
                 reject(err);
             }
         });
@@ -303,11 +475,13 @@ class PChessGame {
 
     attemptReconnect() {
         if (this.reconnectAttempts >= 5) {
+            debugLog('error', 'Reconnect thất bại 5 lần, hủy phiên');
             showToast('Không thể kết nối lại. Vui lòng tạo phòng mới.', 'error');
             this.leaveRoom();
             return;
         }
         this.reconnectAttempts++;
+        debugLog('warn', 'Lần reconnect thứ', this.reconnectAttempts);
         setTimeout(() => {
             if (this.peer && !this.peer.destroyed) {
                 this.peer.reconnect();
@@ -318,6 +492,7 @@ class PChessGame {
     // ===== Room Management =====
     async createRoom() {
         try {
+            debugLog('info', 'Tạo phòng mới...');
             this.showPage('landing-page', false);
             this.showPage('lobby-page', true);
             document.getElementById('connection-text').textContent = 'Đang tạo phòng...';
@@ -326,6 +501,7 @@ class PChessGame {
             this.isHost = true;
             this.myColor = 'w';
             this.roomId = this.myId;
+            debugLog('info', 'Phòng tạo xong, roomId =', this.roomId);
 
             const link = this.generateRoomLink();
             document.getElementById('room-link-display').value = link;
@@ -348,6 +524,7 @@ class PChessGame {
 
     async joinRoom(roomId) {
         try {
+            debugLog('info', 'Join phòng:', roomId);
             this.showPage('landing-page', false);
             this.showPage('lobby-page', true);
             document.getElementById('connection-text').textContent = 'Đang kết nối...';
@@ -357,6 +534,7 @@ class PChessGame {
             this.myColor = 'b';
             this.roomId = roomId;
 
+            debugLog('info', 'Đang connect tới peer:', roomId);
             const conn = this.peer.connect(roomId, {
                 reliable: true,
                 metadata: { peerId: this.myId }
@@ -438,11 +616,12 @@ class PChessGame {
         this.conn = conn;
 
         conn.on('open', () => {
-            console.log('Connection opened with', conn.peer);
+            debugLog('info', 'DataConnection open với', conn.peer);
+            this.connOpen = true;
             this.reconnectAttempts = 0;
 
             if (this.isHost) {
-                // Host sends initial game state
+                debugLog('info', 'Host gửi init cho guest');
                 this.sendMessage({
                     type: 'init',
                     color: 'b',
@@ -461,7 +640,8 @@ class PChessGame {
         });
 
         conn.on('close', () => {
-            console.log('Connection closed');
+            debugLog('warn', 'DataConnection bị đóng với', conn.peer);
+            this.connOpen = false;
             document.querySelector('.status-dot').classList.remove('connected');
             document.querySelector('.status-dot').classList.add('disconnected');
             document.getElementById('connection-text').textContent = 'Mất kết nối';
@@ -473,18 +653,28 @@ class PChessGame {
         });
 
         conn.on('error', (err) => {
-            console.error('Connection error:', err);
-            showToast('Lỗi kết nối P2P', 'error');
+            debugLog('error', 'Conn error:', err.type, err.message);
+            if (!this.connOpen && !this.gameActive) {
+                showToast('Không vào được phòng: ' + (err.message || err.type || 'peer unavailable'), 'error');
+                this.cleanup();
+                this.showPage('landing-page', true);
+                this.showPage('lobby-page', false);
+            } else {
+                showToast('Lỗi kết nối P2P', 'error');
+            }
         });
     }
 
     sendMessage(data) {
         if (this.conn && this.conn.open) {
             try {
+                debugLog('log', 'Gửi →', data.type);
                 this.conn.send(data);
             } catch (err) {
-                console.error('Send error:', err);
+                debugLog('error', 'Send error:', err);
             }
+        } else {
+            debugLog('warn', 'Không gửi được', data.type, '- conn chưa mở hoặc không tồn tại');
         }
     }
 
@@ -1433,4 +1623,5 @@ class PChessGame {
 // ===== Initialize =====
 document.addEventListener('DOMContentLoaded', () => {
     window.game = new PChessGame();
+    DebugPanel.init();
 });
