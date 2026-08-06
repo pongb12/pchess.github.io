@@ -6,7 +6,6 @@
     <title>PChess - Cờ Vua P2P</title>
     <link rel="stylesheet" href="css/style.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.1/chess.min.js"></script>
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 </head>
 <body>
     <div id="app">
@@ -229,7 +228,7 @@
                     <div class="panel-section connection-info">
                         <div class="connection-badge" id="connection-badge">
                             <span class="badge-dot"></span>
-                            <span class="badge-text">P2P</span>
+                            <span class="badge-text">Server</span>
                         </div>
                     </div>
                 </aside>
@@ -343,10 +342,10 @@
         <div id="toast-container"></div>
 
         <!-- Debug Panel -->
-        <button id="btn-debug-toggle" title="Debug P2P">🐞</button>
+        <button id="btn-debug-toggle" title="Debug kết nối">🐞</button>
         <div id="debug-panel">
             <div class="debug-header">
-                <span>🐞 Debug P2P</span>
+                <span>🐞 Debug WS</span>
                 <div class="debug-actions">
                     <button id="btn-debug-copy" title="Copy logs">📋</button>
                     <button id="btn-debug-clear" title="Xóa log">🗑️</button>
@@ -356,7 +355,7 @@
             <div id="debug-status">Loading...</div>
             <div id="debug-log"></div>
             <div class="debug-footer">
-                <button id="btn-debug-reconnect">🔄 Reconnect Peer</button>
+                <button id="btn-debug-reconnect">🔄 Reconnect WS</button>
             </div>
         </div>
     </div>

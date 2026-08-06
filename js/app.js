@@ -1,33 +1,26 @@
 /**
- * PChess - P2P Chess Game
- * Multiplayer chess over WebRTC/PeerJS with no backend server
+ * PChess - Cờ vua trực tuyến qua WebSocket relay (Cloudflare Durable Objects)
+ * Server-authoritative: nước đi được validate bằng chess.js trên server.
  */
 
 // ===== Configuration =====
 const CONFIG = {
-    PEER_CONFIG: {
-        host: '0.peerjs.com',
-        port: 443,
-        secure: true,
-        debug: 1,
-        config: {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' },
-                { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-                { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
-            ]
-        }
-    },
+    // Đổi thành URL worker thật sau khi deploy: npx wrangler deploy (xem README)
+    WS_URL: 'wss://pchess-worker.<subdomain>.workers.dev',
     MOVE_RATE_LIMIT: 100, // ms between moves
     RECONNECT_DELAY: 3000,
     SYNC_INTERVAL: 5000,
     DEFAULT_TIMER: 0, // 0 = no limit
+    PIECE_BASE_URL: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/300',
     PIECES: {
-        w: { k: '♔', q: '♕', r: '♖', b: '♗', n: '♘', p: '♙' },
-        b: { k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' }
+        w: { k: 'wk.png', q: 'wq.png', r: 'wr.png', b: 'wb.png', n: 'wn.png', p: 'wp.png' },
+        b: { k: 'bk.png', q: 'bq.png', r: 'br.png', b: 'bb.png', n: 'bn.png', p: 'bp.png' }
     }
 };
+
+function getPieceUrl(color, type) {
+    return CONFIG.PIECE_BASE_URL + '/' + CONFIG.PIECES[color][type];
+}
 
 // ===== Sound Manager (Web Audio API) =====
 class SoundManager {
@@ -231,25 +224,15 @@ const DebugPanel = {
 
         const lines = [];
         try {
-            lines.push(`Role: ${g.isHost ? 'Host' : (g.myColor ? 'Guest' : 'Idle')} | Color: ${g.myColor || '-'}`);
-            lines.push(`PeerID: ${g.myId || '-'}`);
-            if (g.peer) {
-                lines.push(`Peer: ${g.peer.destroyed ? 'destroyed' : (g.peer.disconnected ? 'disconnected' : 'open')}`);
+            lines.push(`Role: ${g.role || (g.isHost ? 'Host' : (g.myColor ? 'Guest' : 'Idle'))} | Color: ${g.myColor || '-'}`);
+            lines.push(`Room: ${g.roomId || '-'}`);
+            if (g.ws) {
+                const states = { 0: 'CONNECTING', 1: 'OPEN', 2: 'CLOSING', 3: 'CLOSED' };
+                lines.push(`WS: ${states[g.ws.readyState] || g.ws.readyState}`);
             } else {
-                lines.push('Peer: none');
+                lines.push('WS: none');
             }
-            if (g.conn) {
-                const c = g.conn;
-                lines.push(`Conn: ${c.open ? 'open' : 'connecting/closed'} → ${c.peer || '-'}`);
-                const pc = c.peerConnection || c._pc;
-                if (pc) {
-                    lines.push(`ICE: ${pc.iceConnectionState} | SDP: ${pc.signalingState} | Gathering: ${pc.iceGatheringState}`);
-                } else {
-                    lines.push('ICE: n/a (chưa có RTCPeerConnection)');
-                }
-            } else {
-                lines.push('Conn: none');
-            }
+            lines.push(`Ping: ${g.lastPing != null ? g.lastPing + 'ms' : '-'}`);
         } catch (err) {
             lines.push('Lỗi đọc trạng thái: ' + err.message);
         }
@@ -282,18 +265,16 @@ const DebugPanel = {
 
     reconnect() {
         const g = window.game;
-        if (!g || !g.peer) {
-            this.log('error', ['Chưa có peer (chưa tạo/join phòng)']);
+        if (!g || !g.roomId) {
+            this.log('error', ['Chưa có phòng (chưa tạo/join)']);
             return;
         }
-        if (g.peer.destroyed) {
-            this.log('error', ['Peer đã bị destroy, không reconnect được. Cần tạo phòng mới.']);
-        } else if (g.peer.disconnected) {
-            g.peer.reconnect();
-            this.log('info', ['Đang reconnect peer...']);
-        } else {
-            this.log('info', ['Peer vẫn open, không cần reconnect']);
+        if (g.ws && g.ws.readyState === WebSocket.OPEN) {
+            this.log('info', ['WS vẫn open, không cần reconnect']);
+            return;
         }
+        g.connectRoom(g.roomId, g.role || (g.isHost ? 'host' : 'guest'));
+        this.log('info', ['Đang reconnect WS...']);
     }
 };
 
@@ -301,13 +282,14 @@ const DebugPanel = {
 class PChessGame {
     constructor() {
         this.chess = new Chess();
-        this.peer = null;
-        this.conn = null;
-        this.connOpen = false;
-        this.myId = null;
+        this.ws = null;
+        this.wsOpen = false;
+        this.heartbeatInterval = null;
+        this.role = null; // 'host' hoặc 'guest'
         this.roomId = null;
         this.isHost = false;
         this.myColor = null; // 'w' or 'b'
+        this.lastPing = null;
         this.selectedSquare = null;
         this.validMoves = [];
         this.dragFrom = null;
@@ -437,59 +419,98 @@ class PChessGame {
         this.soundManager.setEnabled(this.settings.sound);
     }
 
-    // ===== PeerJS Setup =====
-    setupPeer() {
+    // ===== WebSocket Setup =====
+    connectRoom(roomCode, role) {
         return new Promise((resolve, reject) => {
             try {
-                debugLog('info', 'Tạo PeerJS với config', CONFIG.PEER_CONFIG);
-                this.peer = new Peer(CONFIG.PEER_CONFIG);
+                debugLog('info', 'Kết nối WS tới phòng', roomCode, 'role =', role);
+                this.roomId = roomCode;
+                this.role = role;
+                const wsUrl = CONFIG.WS_URL + '/room?code=' + encodeURIComponent(roomCode) + '&role=' + role;
+                this.ws = new WebSocket(wsUrl);
 
-                this.peer.on('open', (id) => {
-                    this.myId = id;
-                    debugLog('info', 'PeerJS open, ID =', id);
-                    resolve(id);
-                });
+                this.ws.onopen = () => {
+                    debugLog('info', 'WS open');
+                    this.wsOpen = true;
+                    this.reconnectAttempts = 0;
+                    this.startHeartbeat();
+                    resolve(roomCode);
+                };
 
-                this.peer.on('connection', (conn) => {
-                    debugLog('info', 'Có kết nối đến từ', conn.peer);
-                    this.handleConnection(conn);
-                });
+                this.ws.onmessage = (event) => this.onWsMessage(event);
 
-                this.peer.on('error', (err) => {
-                    debugLog('error', 'PeerJS error:', err.type, err.message);
-                    showToast('Lỗi kết nối: ' + err.message, 'error');
-                    reject(err);
-                });
+                this.ws.onclose = (event) => this.handleWsClose(event);
 
-                this.peer.on('disconnected', () => {
-                    debugLog('warn', 'Peer bị disconnected, thử reconnect...');
-                    showToast('Mất kết nối, đang thử kết nối lại...', 'warning');
-                    this.attemptReconnect();
-                });
+                this.ws.onerror = (err) => {
+                    debugLog('error', 'WS error:', err && err.message ? err.message : '');
+                };
             } catch (err) {
-                debugLog('error', 'setupPeer exception:', err);
+                debugLog('error', 'connectRoom exception:', err);
                 reject(err);
             }
         });
     }
 
-    attemptReconnect() {
-        if (this.reconnectAttempts >= 5) {
-            debugLog('error', 'Reconnect thất bại 5 lần, hủy phiên');
+    startHeartbeat() {
+        this.stopHeartbeat();
+        this.heartbeatInterval = setInterval(() => {
+            this.sendMessage({ type: 'ping', timestamp: Date.now() });
+        }, 25000);
+    }
+
+    stopHeartbeat() {
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
+    }
+
+    handleWsClose(event) {
+        this.wsOpen = false;
+        this.stopHeartbeat();
+        debugLog('warn', 'WS đóng, code =', event && event.code);
+
+        if (!this.ws) return; // đóng chủ động (leaveRoom / cleanup)
+
+        const statusDot = document.querySelector('.status-dot');
+        if (statusDot) {
+            statusDot.classList.remove('connected');
+            statusDot.classList.add('disconnected');
+        }
+        const connText = document.getElementById('connection-text');
+        if (connText) connText.textContent = 'Mất kết nối';
+
+        if (this.gameActive && this.reconnectAttempts < 5) {
+            showToast('Mất kết nối, đang thử kết nối lại...', 'warning');
+            this.reconnectAttempts++;
+            setTimeout(() => {
+                if (this.roomId && this.role) {
+                    debugLog('warn', 'Reconnect lần', this.reconnectAttempts, 'tới', this.roomId);
+                    this.connectRoom(this.roomId, this.role);
+                }
+            }, CONFIG.RECONNECT_DELAY);
+        } else if (this.gameActive) {
             showToast('Không thể kết nối lại. Vui lòng tạo phòng mới.', 'error');
             this.leaveRoom();
-            return;
+        } else {
+            // Chưa vào ván mà mất kết nối: thường do CONFIG.WS_URL chưa đổi / chưa deploy worker
+            showToast('Không kết nối được server. Kiểm tra CONFIG.WS_URL và deploy worker (xem README).', 'error');
+            this.cleanup();
+            this.showPage('lobby-page', false);
+            this.showPage('landing-page', true);
         }
-        this.reconnectAttempts++;
-        debugLog('warn', 'Lần reconnect thứ', this.reconnectAttempts);
-        setTimeout(() => {
-            if (this.peer && !this.peer.destroyed) {
-                this.peer.reconnect();
-            }
-        }, CONFIG.RECONNECT_DELAY);
     }
 
     // ===== Room Management =====
+    generateRoomCode() {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+        let code = '';
+        for (let i = 0; i < 6; i++) {
+            code += chars[Math.floor(Math.random() * chars.length)];
+        }
+        return code;
+    }
+
     async createRoom() {
         try {
             debugLog('info', 'Tạo phòng mới...');
@@ -497,11 +518,11 @@ class PChessGame {
             this.showPage('lobby-page', true);
             document.getElementById('connection-text').textContent = 'Đang tạo phòng...';
 
-            await this.setupPeer();
+            const code = this.generateRoomCode();
             this.isHost = true;
             this.myColor = 'w';
-            this.roomId = this.myId;
-            debugLog('info', 'Phòng tạo xong, roomId =', this.roomId);
+            this.role = 'host';
+            await this.connectRoom(code, 'host');
 
             const link = this.generateRoomLink();
             document.getElementById('room-link-display').value = link;
@@ -509,9 +530,10 @@ class PChessGame {
 
             // Save to session storage for reconnect
             sessionStorage.setItem('pchess_room', JSON.stringify({
-                roomId: this.roomId,
-                isHost: true,
-                color: 'w'
+                roomId: code,
+                role: 'host',
+                color: 'w',
+                isHost: true
             }));
 
             showToast('Phòng đã tạo! Gửi link cho đối thủ.', 'success');
@@ -529,24 +551,17 @@ class PChessGame {
             this.showPage('lobby-page', true);
             document.getElementById('connection-text').textContent = 'Đang kết nối...';
 
-            await this.setupPeer();
             this.isHost = false;
             this.myColor = 'b';
-            this.roomId = roomId;
-
-            debugLog('info', 'Đang connect tới peer:', roomId);
-            const conn = this.peer.connect(roomId, {
-                reliable: true,
-                metadata: { peerId: this.myId }
-            });
-
-            this.handleConnection(conn);
+            this.role = 'guest';
+            await this.connectRoom(roomId, 'guest');
 
             // Save to session storage
             sessionStorage.setItem('pchess_room', JSON.stringify({
-                roomId: this.roomId,
-                isHost: false,
-                color: 'b'
+                roomId: roomId,
+                role: 'guest',
+                color: 'b',
+                isHost: false
             }));
         } catch (err) {
             showToast('Không thể vào phòng: ' + err.message, 'error');
@@ -577,20 +592,26 @@ class PChessGame {
 
     checkUrlForRoom() {
         const hash = window.location.hash.replace('#', '');
-        if (hash && hash.length > 5) {
+        if (hash && hash.length >= 4) {
             document.getElementById('input-room-link').value = window.location.href;
             // Auto-join after a short delay
             setTimeout(() => this.joinRoom(hash), 500);
+            return;
         }
 
         // Check session storage for reconnect
         const saved = sessionStorage.getItem('pchess_room');
-        if (saved && !hash) {
+        if (saved) {
             try {
                 const data = JSON.parse(saved);
-                if (data.isHost) {
-                    // Host can reconnect to waiting state
-                    this.createRoom();
+                if (data.roomId && data.role) {
+                    debugLog('info', 'Tự động kết nối lại phòng', data.roomId, 'role =', data.role);
+                    this.showPage('landing-page', false);
+                    this.showPage('lobby-page', true);
+                    document.getElementById('connection-text').textContent = 'Đang kết nối lại...';
+                    this.isHost = data.role === 'host';
+                    this.myColor = data.color || (this.isHost ? 'w' : 'b');
+                    this.connectRoom(data.roomId, data.role);
                 }
             } catch (e) {
                 sessionStorage.removeItem('pchess_room');
@@ -612,69 +633,27 @@ class PChessGame {
     }
 
     // ===== Connection Handling =====
-    handleConnection(conn) {
-        this.conn = conn;
-
-        conn.on('open', () => {
-            debugLog('info', 'DataConnection open với', conn.peer);
-            this.connOpen = true;
-            this.reconnectAttempts = 0;
-
-            if (this.isHost) {
-                debugLog('info', 'Host gửi init cho guest');
-                this.sendMessage({
-                    type: 'init',
-                    color: 'b',
-                    settings: this.settings,
-                    fen: this.chess.fen()
-                });
-                this.startGame();
-            }
-
-            document.querySelector('.status-dot').classList.add('connected');
-            document.getElementById('connection-text').textContent = 'Đã kết nối!';
-        });
-
-        conn.on('data', (data) => {
-            this.handleMessage(data);
-        });
-
-        conn.on('close', () => {
-            debugLog('warn', 'DataConnection bị đóng với', conn.peer);
-            this.connOpen = false;
-            document.querySelector('.status-dot').classList.remove('connected');
-            document.querySelector('.status-dot').classList.add('disconnected');
-            document.getElementById('connection-text').textContent = 'Mất kết nối';
-
-            if (this.gameActive) {
-                showToast('Đối thủ đã ngắt kết nối', 'error');
-                this.stopTimer();
-            }
-        });
-
-        conn.on('error', (err) => {
-            debugLog('error', 'Conn error:', err.type, err.message);
-            if (!this.connOpen && !this.gameActive) {
-                showToast('Không vào được phòng: ' + (err.message || err.type || 'peer unavailable'), 'error');
-                this.cleanup();
-                this.showPage('landing-page', true);
-                this.showPage('lobby-page', false);
-            } else {
-                showToast('Lỗi kết nối P2P', 'error');
-            }
-        });
+    onWsMessage(event) {
+        let msg;
+        try {
+            msg = JSON.parse(event.data);
+        } catch (e) {
+            debugLog('error', 'JSON lỗi từ WS:', event.data);
+            return;
+        }
+        this.handleMessage(msg);
     }
 
     sendMessage(data) {
-        if (this.conn && this.conn.open) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             try {
                 debugLog('log', 'Gửi →', data.type);
-                this.conn.send(data);
+                this.ws.send(JSON.stringify(data));
             } catch (err) {
                 debugLog('error', 'Send error:', err);
             }
         } else {
-            debugLog('warn', 'Không gửi được', data.type, '- conn chưa mở hoặc không tồn tại');
+            debugLog('warn', 'Không gửi được', data.type, '- WS chưa mở hoặc không tồn tại');
         }
     }
 
@@ -686,8 +665,23 @@ class PChessGame {
             case 'init':
                 this.handleInit(msg);
                 break;
+            case 'joined':
+                this.handleJoined(msg);
+                break;
+            case 'peer_joined':
+                this.handlePeerJoined();
+                break;
+            case 'peer_left':
+                this.handlePeerLeft();
+                break;
             case 'move':
                 this.handleRemoteMove(msg);
+                break;
+            case 'move_rejected':
+                this.handleMoveRejected(msg);
+                break;
+            case 'room-full':
+                this.handleRoomFull();
                 break;
             case 'sync':
                 this.handleSync(msg);
@@ -726,9 +720,113 @@ class PChessGame {
                 this.sendMessage({ type: 'pong', timestamp: msg.timestamp });
                 break;
             case 'pong':
-                // Latency calculation if needed
+                if (msg.timestamp) {
+                    this.lastPing = Date.now() - msg.timestamp;
+                }
                 break;
         }
+    }
+
+    handleJoined(msg) {
+        debugLog('info', 'Joined phòng: role =', msg.role, ', color =', msg.color, ', ván dở =', !!msg.game);
+        this.myColor = msg.color;
+        if (msg.role) {
+            this.role = msg.role;
+            this.isHost = msg.role === 'host';
+        }
+
+        const statusDot = document.querySelector('.status-dot');
+        if (statusDot) {
+            statusDot.classList.add('connected');
+            statusDot.classList.remove('disconnected');
+        }
+        const connText = document.getElementById('connection-text');
+        if (connText) {
+            connText.textContent = (this.isHost && !msg.game) ? 'Đang chờ đối thủ...' : 'Đã kết nối!';
+        }
+
+        if (msg.game && msg.game.fen) {
+            // Nối lại ván cờ đang dở (trạng thái server là nguồn sự thật)
+            this.chess.load(msg.game.fen);
+            this.moveHistory = msg.game.history || [];
+            this.capturedPieces = this.deriveCaptured(this.moveHistory);
+            this.gameActive = true;
+            this.currentTurn = this.chess.turn();
+            this.showPage('lobby-page', false);
+            this.showPage('game-page', true);
+            document.getElementById('self-color').textContent = this.myColor === 'w' ? 'Trắng' : 'Đen';
+            document.getElementById('opponent-color').textContent = this.myColor === 'w' ? 'Đen' : 'Trắng';
+            this.renderBoard();
+            this.updateGameStatus();
+            this.updateMoveList();
+            this.updateCapturedPieces();
+            this.updateTimerDisplay();
+            this.startTimer();
+            showToast('Đã nối lại ván cờ đang dở', 'info');
+        } else if (this.isHost && this.gameActive) {
+            this.requestSync();
+        }
+    }
+
+    handlePeerJoined() {
+        debugLog('info', 'Đối thủ đã vào phòng');
+        const statusDot = document.querySelector('.status-dot');
+        if (statusDot) {
+            statusDot.classList.add('connected');
+            statusDot.classList.remove('disconnected');
+        }
+        const connText = document.getElementById('connection-text');
+        if (connText) connText.textContent = 'Đã kết nối!';
+
+        if (!this.isHost) {
+            showToast('Đối thủ đã kết nối lại!', 'success');
+        }
+
+        if (this.isHost) {
+            this.showPage('lobby-page', false);
+            if (this.gameActive) {
+                this.requestSync();
+            } else {
+                debugLog('info', 'Host gửi init cho guest');
+                this.sendMessage({
+                    type: 'init',
+                    color: 'b',
+                    settings: this.settings,
+                    fen: this.chess.fen()
+                });
+                this.startGame();
+            }
+        }
+    }
+
+    handlePeerLeft() {
+        debugLog('warn', 'Đối thủ đã rời phòng');
+        const statusDot = document.querySelector('.status-dot');
+        if (statusDot) {
+            statusDot.classList.remove('connected');
+            statusDot.classList.add('disconnected');
+        }
+        const connText = document.getElementById('connection-text');
+        if (connText) connText.textContent = 'Mất kết nối';
+
+        if (this.gameActive) {
+            showToast('Đối thủ đã ngắt kết nối', 'error');
+            this.stopTimer();
+        }
+    }
+
+    handleMoveRejected(msg) {
+        debugLog('error', 'Nước đi bị server từ chối:', msg && msg.reason);
+        showToast('Nước đi bị từ chối: ' + (msg.reason === 'not_your_turn' ? 'chưa đến lượt bạn' : (msg.reason === 'rate_limit' ? 'đi quá nhanh' : 'không hợp lệ')), 'error');
+        this.requestSync();
+    }
+
+    handleRoomFull() {
+        showToast('Phòng đã đầy! (tối đa 2 người)', 'error');
+        this.cleanup();
+        this.showPage('lobby-page', false);
+        this.showPage('landing-page', true);
+        sessionStorage.removeItem('pchess_room');
     }
 
     handleInit(msg) {
@@ -812,7 +910,11 @@ class PChessGame {
         if (msg.fen && msg.fen !== this.chess.fen()) {
             this.chess.load(msg.fen);
             this.moveHistory = msg.history || [];
-            this.capturedPieces = msg.captured || { w: [], b: [] };
+            if (msg.captured) {
+                this.capturedPieces = msg.captured;
+            } else {
+                this.capturedPieces = this.deriveCaptured(this.moveHistory);
+            }
             this.currentTurn = this.chess.turn();
             this.renderBoard();
             this.updateMoveList();
@@ -827,6 +929,20 @@ class PChessGame {
 
             showToast('Đã đồng bộ trạng thái game', 'info');
         }
+    }
+
+    deriveCaptured(history) {
+        const captured = { w: [], b: [] };
+        try {
+            const ch = new Chess();
+            for (const san of history) {
+                const m = ch.move(san);
+                if (m && m.captured) captured[m.color].push(m.captured);
+            }
+        } catch (e) {
+            debugLog('warn', 'Không dựng lại captured được từ lịch sử:', e);
+        }
+        return captured;
     }
 
     requestSync() {
@@ -902,9 +1018,11 @@ class PChessGame {
                 // Piece
                 const piece = this.chess.get(squareName);
                 if (piece) {
-                    const pieceEl = document.createElement('span');
-                    pieceEl.className = `piece ${piece.color}`;
-                    pieceEl.textContent = CONFIG.PIECES[piece.color][piece.type];
+                    const pieceEl = document.createElement('img');
+                    pieceEl.className = `piece ${piece.color} piece-img`;
+                    pieceEl.src = getPieceUrl(piece.color, piece.type);
+                    pieceEl.alt = piece.color + piece.type;
+                    pieceEl.draggable = false;
 
                     const canDrag = this.gameActive && !this.pendingPromotion &&
                         this.chess.turn() === this.myColor && piece.color === this.myColor;
@@ -1082,7 +1200,7 @@ class PChessGame {
         const pieces = modal.querySelectorAll('.promotion-piece');
         pieces.forEach(p => {
             const type = p.dataset.piece;
-            p.textContent = CONFIG.PIECES[color][type];
+            p.innerHTML = `<img src="${getPieceUrl(color, type)}" alt="${color}${type}">`;
         });
         modal.classList.remove('hidden');
     }
@@ -1096,70 +1214,23 @@ class PChessGame {
     }
 
     executeMove(from, to, promotion = 'q') {
-        // Anti-cheat: validate locally
-        const moveObj = { from, to, promotion };
-        const result = this.chess.move(moveObj);
+        if (!this.gameActive) return;
 
-        if (!result) {
-            showToast('Nước đi không hợp lệ', 'error');
-            this.clearSelection();
-            return;
-        }
-
-        // Rate limiting
+        // Rate limiting (chỉ cảnh báo, server mới quyết định)
         const now = Date.now();
         if (now - this.lastMoveTime < CONFIG.MOVE_RATE_LIMIT) {
-            // Too fast, but still allow (just log)
             console.warn('Move rate limit warning');
         }
         this.lastMoveTime = now;
 
-        // Update local state
-        this.lastMove = { from, to };
-        this.moveHistory.push(result.san);
-        if (result.captured) {
-            this.capturedPieces[this.myColor].push(result.captured);
-        }
-
-        // Play sound
-        if (result.captured) {
-            this.soundManager.play('capture');
-        } else if (result.flags.includes('k') || result.flags.includes('q')) {
-            this.soundManager.play('castle');
-        } else if (result.promotion) {
-            this.soundManager.play('promote');
-        } else {
-            this.soundManager.play('move');
-        }
-
-        // Send to opponent
+        // Server-authoritative: gửi lên server, server validate + broadcast
+        // nước đi hợp lệ. Không tự áp dụng nước đi ở client.
         this.sendMessage({
             type: 'move',
-            move: { from, to, promotion },
-            san: result.san,
-            fen: this.chess.fen()
+            move: { from, to, promotion }
         });
 
-        // Update UI
         this.clearSelection();
-        this.updateGameStatus();
-        this.renderBoard();
-        this.updateMoveList();
-        this.updateCapturedPieces();
-
-        // Switch timer
-        this.currentTurn = this.chess.turn();
-        this.startTimer();
-
-        // Check for check
-        if (this.chess.in_check()) {
-            this.soundManager.play('check');
-        }
-
-        // Check game over
-        if (this.chess.game_over()) {
-            this.handleGameOver();
-        }
     }
 
     // ===== Game Status & Timer =====
@@ -1342,7 +1413,7 @@ class PChessGame {
     // ===== Rematch =====
     requestRematch() {
         document.getElementById('gameover-modal').classList.add('hidden');
-        this.rematchState = { requested: true, by: this.myId };
+        this.rematchState = { requested: true, by: this.role };
         this.sendMessage({ type: 'rematch_request' });
         showToast('Đã gửi yêu cầu chơi lại', 'info');
     }
@@ -1527,11 +1598,11 @@ class PChessGame {
         const oppColor = selfColor === 'w' ? 'b' : 'w';
 
         selfContainer.innerHTML = this.capturedPieces[selfColor]
-            .map(p => `<span class="captured-piece">${CONFIG.PIECES[oppColor][p]}</span>`)
+            .map(p => `<img class="captured-piece" src="${getPieceUrl(oppColor, p)}" alt="${oppColor}${p}">`)
             .join('');
 
         oppContainer.innerHTML = this.capturedPieces[oppColor]
-            .map(p => `<span class="captured-piece">${CONFIG.PIECES[selfColor][p]}</span>`)
+            .map(p => `<img class="captured-piece" src="${getPieceUrl(selfColor, p)}" alt="${selfColor}${p}">`)
             .join('');
     }
 
@@ -1605,14 +1676,16 @@ class PChessGame {
 
     cleanup() {
         this.stopTimer();
-        if (this.conn) {
-            this.conn.close();
-            this.conn = null;
+        this.stopHeartbeat();
+        if (this.ws) {
+            try {
+                this.ws.close();
+            } catch (e) {
+                // ignore
+            }
+            this.ws = null;
         }
-        if (this.peer) {
-            this.peer.destroy();
-            this.peer = null;
-        }
+        this.wsOpen = false;
     }
 
     handleResize() {

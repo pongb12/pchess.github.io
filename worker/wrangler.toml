@@ -1,0 +1,12 @@
+name = "pchess-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Durable Object: relay WebSocket + validate nước đi (server-authoritative)
+[[durable_objects.bindings]]
+name = "PCHESS_ROOM"
+class_name = "PChessRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PChessRoom"]
