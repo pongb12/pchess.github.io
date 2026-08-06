@@ -5,8 +5,7 @@
 
 // ===== Configuration =====
 const CONFIG = {
-    // Đổi thành URL worker thật sau khi deploy: npx wrangler deploy (xem README)
-    WS_URL: 'wss://pchess-worker.<subdomain>.workers.dev',
+    WS_URL: 'wss://pchess-github-io.st163943.workers.dev',
     MOVE_RATE_LIMIT: 100, // ms between moves
     RECONNECT_DELAY: 3000,
     SYNC_INTERVAL: 5000,
