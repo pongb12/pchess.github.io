@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { Chess } from 'chess.js';
+import { Chess } from '../lib/chess.js';
 
 interface Env {
   PCHESS_ROOM: DurableObjectNamespace;

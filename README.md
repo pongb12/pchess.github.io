@@ -7,9 +7,9 @@ PChess là web game cờ vua 2 người chơi qua **WebSocket relay** chạy tr�
 - **Real-time qua WebSocket**: Kết nối ổn định qua relay server (Cloudflare Workers + Durable Objects), không phụ thuộc NAT/TURN như WebRTC
 - **Session/Link phòng**: Host tạo phòng → sinh link ngắn (`#code`) → đối thủ mở link vào chơi ngay
 - **Luật cờ đầy đủ**: Nhập thành, bắt tốt qua đường, phong cấp, chiếu, chiếu hết, hòa
-- **Server-authoritative / Anti-cheat**: 
+- **Server-authoritative / Anti-cheat**:
   - Nước đi được validate bằng chess.js **trên server**
-  - Server giữ FEN + lịch sử nước đi, client chỉ hiển thị
+  - Server giữ FEN + lịch sử nước đi (SQLite), client chỉ hiển thị
   - Chặn đi sai lượt, đi quân của đối thủ, nước bất hợp lệ, spam (rate limit)
   - `move_rejected` trả về khi nước đi bị từ chối
 - **Tự đồng bộ / Nối lại ván dở**: Refresh trang hoặc mất mạng → tự kết nối lại phòng và khôi phục ván cờ từ server
@@ -21,6 +21,8 @@ PChess là web game cờ vua 2 người chơi qua **WebSocket relay** chạy tr�
 
 ## 📁 Cấu trúc thư mục
 
+Một Worker duy nhất vừa phục vụ trang tĩnh vừa làm relay WebSocket:
+
 ```
 pchess/
 ├── index.html              # Giao diện chính (landing, lobby, game, modals)
@@ -28,61 +30,35 @@ pchess/
 │   └── style.css           # Styling + 4 theme + responsive
 ├── js/
 │   └── app.js              # Logic game, WebSocket client, chess.js, sound, timer
-├── worker/                 # Cloudflare Worker (relay + validate)
-│   ├── wrangler.toml       # Config Durable Object binding
-│   ├── package.json
-│   └── src/
-│       └── index.ts        # PChessRoom Durable Object (WebSocket relay + chess.js)
+├── src/
+│   └── index.ts            # PChessRoom Durable Object (WebSocket relay + chess.js)
+├── lib/
+│   └── chess.js            # chess.js 0.13.4 (bản ESM, vendor để build không cần npm)
+├── wrangler.toml           # Config Worker: tên pchess-github-io + DO + static assets
 └── README.md               # Hướng dẫn này
 ```
 
-## 🛠️ 1. Deploy Worker (BẮT BUỘC — app cần server để chơi)
+## 🌐 Deploy (Workers Builds — tự động khi push)
 
-App không còn dùng PeerJS nữa; mọi kết nối đi qua relay Worker. Cần deploy 1 lần:
+Repo được kết nối sẵn với **Cloudflare Workers Builds** (project `pchess-github-io`), build command là `npx wrangler deploy` chạy ở thư mục gốc. **Chỉ cần `git push` — mọi thứ tự deploy.**
 
-```bash
-cd worker
-npm install
-npx wrangler login       # đăng nhập Cloudflare (mở trình duyệt)
-npx wrangler deploy
-```
+URL của app + relay: `https://pchess-github-io.st163943.workers.dev`
 
-Sau khi deploy, Cloudflare in ra URL dạng:
-`https://pchess-worker.<subdomain>.workers.dev`
-
-**Dán URL đó vào `js/app.js`**:
-
-```js
-// js/app.js
-const CONFIG = {
-    WS_URL: 'wss://pchess-worker.<subdomain>.workers.dev',
-    ...
-};
-```
-
-> Nhớ dùng `wss://` (không phải `https://`) cho kết nối WebSocket.
-
-### Test local (không cần deploy)
+### Deploy lần đầu bằng tay (nếu cần)
 
 ```bash
-cd worker
+npx wrangler login
+npx wrangler deploy        # chạy ở thư mục gốc
+```
+
+> Trong `js/app.js`, `CONFIG.WS_URL` đã trỏ đúng relay. Nếu deploy sang project khác, đổi `wrangler.toml` (`name`) và `WS_URL` cho khớp.
+
+### Test local
+
+```bash
 npx wrangler dev --port 8787
-# mở index.html, sửa WS_URL tạm thời thành ws://127.0.0.1:8787 để chơi thử
+# Mở http://127.0.0.1:8787 — trang tĩnh + relay chạy chung trên cùng port
 ```
-
-## 🌐 2. Deploy Static Site
-
-### GitHub Pages
-1. Push code lên repo GitHub
-2. Settings → Pages → Source: Deploy from branch → chọn `main` / `root`
-3. Truy cập `https://<username>.github.io/pchess`
-
-### Netlify / Vercel / Cloudflare Pages
-1. Kéo thả thư mục `pchess` lên dashboard
-2. Hoặc connect với Git repo
-3. Site sẽ được deploy tự động
-
-> PChess là **static site thuần** (HTML/CSS/JS), không cần build step.
 
 ## 🎮 Cách chơi
 
@@ -138,4 +114,4 @@ Trình duyệt B ──WebSocket──┘
 
 ## 📜 License
 
-MIT — Tự do sử dụng, chỉnh sửa và deploy.
+MIT — Tự do sử dụng, chỉnh sửa và deploy. (chess.js — BSD-2-Clause, file vendored tại `lib/chess.js`.)

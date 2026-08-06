@@ -1,6 +1,11 @@
-name = "pchess-worker"
+name = "pchess-github-io"
 main = "src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-08-06"
+
+# Phục vụ trang tĩnh (index.html, css, js) + chuyển /room, /health cho worker
+[assets]
+directory = "."
+not_found_handling = "none"
 
 # Durable Object: relay WebSocket + validate nước đi (server-authoritative)
 [[durable_objects.bindings]]

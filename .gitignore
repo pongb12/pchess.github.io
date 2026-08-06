@@ -1,4 +1,2 @@
 node_modules/
-worker/node_modules/
-worker/.wrangler-dist/
 .wrangler/
