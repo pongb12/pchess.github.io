@@ -20,6 +20,13 @@ const MOVE_BURST_MAX = 5;
 const MOVE_BURST_WINDOW_MS = 1000;
 const PROMOTION_TYPES = ['q', 'r', 'b', 'n'];
 
+type Role = 'host' | 'guest';
+const ROLES: Role[] = ['host', 'guest'];
+
+function colorOfRole(role: Role): 'w' | 'b' {
+  return role === 'host' ? 'w' : 'b';
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -53,20 +60,53 @@ export default {
   },
 };
 
-interface Slot {
-  ws: WebSocket;
-  color: 'w' | 'b';
-  lastMoveAt: number;
-  moveCount: number[];
-}
-
 interface GameState {
   fen: string;
   history: string[];
 }
 
 export class PChessRoom extends DurableObject<Env> {
-  private slots: (Slot | null)[] = [null, null];
+  // Trạng thái chống spam theo socket. QUAN TRỌNG: bộ nhớ trong bị xoá sạch khi
+  // Durable Object "ngủ đông" (hibernation) — nên mọi trạng thái phòng PHẢI lấy
+  // từ runtime (ctx.getWebSockets/getTags) hoặc ctx.storage, không được giữ ở
+  // thuộc tính. Hai Map này chỉ chống flood tạm thời, reset khi ngủ đông cũng
+  // chấp nhận được (ván cờ được lưu trong ctx.storage, không bị ảnh hưởng).
+  private lastMoveAt = new Map<WebSocket, number>();
+  private moveCounts = new Map<WebSocket, number[]>();
+
+  // Tìm socket còn mở theo vai trò. getWebSockets(role) hoạt động ngay cả sau
+  // khi DO ngủ đông: runtime giữ các socket, chỉ bộ nhớ trong bị reset. Không
+  // dùng mảng slot trong bộ nhớ — trước đây nó biến mất sau khi ngủ đông nên
+  // đối thủ "không còn ở đó" và không ai nhận được peer_joined (ván không bắt đầu).
+  private socketOf(role: Role): WebSocket | null {
+    for (const ws of this.ctx.getWebSockets(role)) {
+      if (ws.readyState === WebSocket.OPEN) return ws;
+    }
+    return null;
+  }
+
+  private roleOf(ws: WebSocket): Role | null {
+    try {
+      const tags = this.ctx.getTags(ws);
+      for (const role of ROLES) {
+        if (tags.includes(role)) return role;
+      }
+    } catch {
+      /* socket không còn được theo dõi */
+    }
+    return null;
+  }
+
+  private opponent(ws: WebSocket): WebSocket | null {
+    const role = this.roleOf(ws);
+    if (!role) return null;
+    return this.socketOf(role === 'host' ? 'guest' : 'host');
+  }
+
+  private colorOf(ws: WebSocket): 'w' | 'b' | null {
+    const role = this.roleOf(ws);
+    return role ? colorOfRole(role) : null;
+  }
 
   async fetch(request: Request): Promise<Response> {
     const upgrade = request.headers.get('Upgrade');
@@ -75,58 +115,36 @@ export class PChessRoom extends DurableObject<Env> {
     }
 
     const url = new URL(request.url);
-    const claimedRole = url.searchParams.get('role') === 'guest' ? 'guest' : 'host';
+    const claimedRole: Role = url.searchParams.get('role') === 'guest' ? 'guest' : 'host';
     const isReconnect = url.searchParams.get('reconnect') === '1';
-    const alive = this.ctx.getWebSockets();
 
-    // Dọn slot đã đóng. Client mất kết nối (mobile để nền / thoát tab) có thể
-    // để lại socket cũ chưa được webSocketClose dọn -> nếu cứ đếm sẽ tưởng
-    // "phòng đầy" và từ chối nhầm người đang nối lại.
-    for (let i = 0; i < 2; i++) {
-      const s = this.slots[i];
-      if (s && (s.ws.readyState !== WebSocket.OPEN || !alive.includes(s.ws))) {
-        this.slots[i] = null;
+    // Socket cũ cùng vai trò vẫn còn (tìm qua tag — hoạt động cả sau ngủ đông).
+    const existing = this.socketOf(claimedRole);
+
+    // KẾT NỐI LẠI (client gửi reconnect=1): đá socket cũ cùng vai trò để nhường
+    // chỗ. Người VÀO MỚI không được đá — tránh bị chiếm chỗ.
+    // Lưu ý: close() phía server KHÔNG gửi close frame tới client (giới hạn của
+    // Cloudflare WebSocketPair), nên phải gửi 'session-takeover' trước để client
+    // cũ biết phiên đã bị thay thế.
+    if (existing && isReconnect) {
+      try {
+        existing.send(JSON.stringify({ type: 'session-takeover' }));
+      } catch {
+        /* ignore */
+      }
+      try {
+        existing.close(4000, 'reconnect');
+      } catch {
+        /* ignore */
       }
     }
 
-    // Slot theo VAI TRÒ đã khai báo (host=0, guest=1), không phải first-free-slot.
-    // Trước đây ai kết nối đầu tiên chiếm slot 0 = host: người nhận link của host
-    // nếu kết nối trước (hoặc khi slot host đang trống) sẽ bị gán làm HOST -> sai.
-    const roleIdx = claimedRole === 'host' ? 0 : 1;
-    let index = this.slots[roleIdx] ? -1 : roleIdx;
-
-    // Chỉ khi đây là KẾT NỐI LẠI (client gửi reconnect=1): nếu socket cũ cùng
-    // vai trò vẫn "sống" ở server (mất mạng không gửi close frame) thì kick nó
-    // để nhường chỗ. Không áp dụng cho người vào mới -> tránh bị chiếm chỗ.
-    // Lưu ý: close() phía server KHÔNG tới client (giới hạn Cloudflare
-    // WebSocketPair), nên phải gửi 'session-takeover' trước để client cũ biết
-    // phiên đã bị thay thế.
-    if (index < 0 && isReconnect) {
-      const existing = this.slots[roleIdx];
-      if (existing) {
-        try {
-          existing.ws.send(JSON.stringify({ type: 'session-takeover' }));
-        } catch {
-          /* ignore */
-        }
-        try {
-          existing.ws.close(4000, 'reconnect');
-        } catch {
-          /* ignore */
-        }
-        this.slots[roleIdx] = null;
-        index = roleIdx;
-      }
-    }
-
-    if (index < 0) {
-      // Phòng thật sự đầy: 2 người đang chơi.
+    if (existing && !isReconnect) {
+      // Vai trò này đã có người -> phòng đầy. Dùng tag riêng 'roomfull' để
+      // không làm nhiễu việc tìm socket chơi thật (host/guest).
       const pair = new WebSocketPair();
-      this.ctx.acceptWebSocket(pair[1], [claimedRole]);
+      this.ctx.acceptWebSocket(pair[1], ['roomfull']);
       // send() ngay trong fetch bị drop vì handshake client chưa xong -> hoãn lại.
-      // Lưu ý: close() phía server sẽ gỡ socket khỏi DO (tránh phòng bị kẹt) dù
-      // close frame có thể không tới client (giới hạn của Cloudflare WebSocketPair);
-      // client tự đóng socket khi nhận 'room-full' (handleRoomFull).
       setTimeout(() => {
         try {
           pair[1].send(JSON.stringify({ type: 'room-full' }));
@@ -138,24 +156,29 @@ export class PChessRoom extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    const color: 'w' | 'b' = index === 0 ? 'w' : 'b';
-    const role = index === 0 ? 'host' : 'guest';
-
+    const color = colorOfRole(claimedRole);
     const pair = new WebSocketPair();
     const server = pair[1];
-    this.ctx.acceptWebSocket(server, [role]);
-    this.slots[index] = { ws: server, color, lastMoveAt: 0, moveCount: [] };
+    this.ctx.acceptWebSocket(server, [claimedRole]);
 
     // Gửi trạng thái trò chơi đang dở để client nối lại ván (server-authoritative)
     const game = await this.ctx.storage.get<GameState>('game');
-    server.send(JSON.stringify({ type: 'joined', role, color, game: game || null }));
+    server.send(JSON.stringify({ type: 'joined', role: claimedRole, color, game: game || null }));
 
-    const target = this.slots[1 - index];
-    if (target) {
-      target.ws.send(JSON.stringify({ type: 'peer_joined' }));
+    const peer = this.socketOf(claimedRole === 'host' ? 'guest' : 'host');
+    if (peer) {
+      try {
+        peer.send(JSON.stringify({ type: 'peer_joined' }));
+      } catch {
+        /* ignore */
+      }
       // Báo cho cả người vừa vào: nhờ đó host vào SAU guest vẫn nhận peer_joined
       // để gửi 'init' và bắt đầu ván (thứ tự vào phòng không quan trọng).
-      server.send(JSON.stringify({ type: 'peer_joined' }));
+      try {
+        server.send(JSON.stringify({ type: 'peer_joined' }));
+      } catch {
+        /* ignore */
+      }
     }
 
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -195,27 +218,20 @@ export class PChessRoom extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket) {
+    this.lastMoveAt.delete(ws);
+    this.moveCounts.delete(ws);
     const other = this.opponent(ws);
-    const idx = this.slots.findIndex((s) => s && s.ws === ws);
-    if (idx >= 0) this.slots[idx] = null;
-
-    if (other) other.send(JSON.stringify({ type: 'peer_left' }));
+    if (other) {
+      try {
+        other.send(JSON.stringify({ type: 'peer_left' }));
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   async webSocketError(ws: WebSocket) {
     ws.close(1011, 'error');
-  }
-
-  private colorOf(ws: WebSocket): 'w' | 'b' | null {
-    const i = this.slots.findIndex((s) => s && s.ws === ws);
-    return i >= 0 ? this.slots[i]!.color : null;
-  }
-
-  private opponent(ws: WebSocket): WebSocket | null {
-    const i = this.slots.findIndex((s) => s && s.ws === ws);
-    if (i < 0) return null;
-    const other = this.slots[1 - i];
-    return other && other.ws.readyState === WebSocket.OPEN ? other.ws : null;
   }
 
   private relayToPeer(ws: WebSocket, msg: unknown) {
@@ -290,21 +306,18 @@ export class PChessRoom extends DurableObject<Env> {
 
     // Chống spam theo từng socket: người chơi hợp lệ chỉ có thể đi khi tới lượt,
     // nên cùng socket gửi nước đi nhanh liên tục là flood script.
-    const idx = this.slots.findIndex((s) => s && s.ws === ws);
-    if (idx >= 0) {
-      const slot = this.slots[idx]!;
-      const now = Date.now();
-      if (now - slot.lastMoveAt < MOVE_RATE_LIMIT_MS) {
-        reject('rate_limit');
-        return;
-      }
-      slot.lastMoveAt = now;
-      slot.moveCount = slot.moveCount.filter((t) => now - t < MOVE_BURST_WINDOW_MS);
-      slot.moveCount.push(now);
-      if (slot.moveCount.length > MOVE_BURST_MAX) {
-        reject('rate_limit');
-        return;
-      }
+    const now = Date.now();
+    if (now - (this.lastMoveAt.get(ws) ?? 0) < MOVE_RATE_LIMIT_MS) {
+      reject('rate_limit');
+      return;
+    }
+    this.lastMoveAt.set(ws, now);
+    const counts = (this.moveCounts.get(ws) ?? []).filter((t) => now - t < MOVE_BURST_WINDOW_MS);
+    counts.push(now);
+    this.moveCounts.set(ws, counts);
+    if (counts.length > MOVE_BURST_MAX) {
+      reject('rate_limit');
+      return;
     }
 
     const promotion = PROMOTION_TYPES.includes(move.promotion || '') ? move.promotion! : undefined;

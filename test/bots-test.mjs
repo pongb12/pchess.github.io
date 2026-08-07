@@ -444,6 +444,42 @@ async function main() {
   rGuest2.close();
   rGuest.close();
 
+  // 22) DO "ngủ đông" (hibernation): sau ~30s không có I/O, Cloudflare xoá bộ
+  //     nhớ trong của Durable Object nhưng GIỮ các socket WebSocket. Trước đây
+  //     trạng thái phòng (this.slots) bị reset nên khi guest vào SAU host đã chờ
+  //     lâu, server không gửi peer_joined -> ván không bao giờ bắt đầu (đúng bug
+  //     khi chơi 2 thiết bị khác nhau: host chờ, thiết bị thứ 2 mở link). Giờ
+  //     tìm socket qua tag (ctx.getWebSockets(role)) nên phải hoạt động sau ngủ đông.
+  console.log('\n-- Test DO hibernation (host chờ lâu, guest vào sau) --');
+  const hRoom = 'hib' + Date.now().toString(36);
+  const hHost = new Bot('HHOST', hRoom, 'host');
+  await hHost.connect();
+  msg = await hHost.nextType('joined');
+  check('Hibernation: host nhận joined', msg.role === 'host', `got=${msg.role}`);
+  console.log('  ... chờ 40s để DO ngủ đông ...');
+  await wait(40000);
+  const hGuest = new Bot('HGUEST', hRoom, 'guest');
+  await hGuest.connect();
+  msg = await hGuest.nextType('joined');
+  check('Hibernation: guest vào sau nhận joined', msg.role === 'guest', `got=${msg.role}`);
+  msg = await hHost.nextType('peer_joined');
+  check('Hibernation: host nhận peer_joined sau ngủ đông', msg.type === 'peer_joined');
+  msg = await hGuest.nextType('peer_joined');
+  check('Hibernation: guest nhận peer_joined sau ngủ đông', msg.type === 'peer_joined');
+  // Host gửi init -> guest: bình thường do handlePeerJoined trên host.
+  hHost.send({ type: 'init', color: 'b', settings: {}, fen: new Chess().fen() });
+  msg = await hGuest.nextType('init');
+  check('Hibernation: init relay qua socket của host được giữ qua ngủ đông', msg.type === 'init');
+  hHost.send({ type: 'move', move: { from: 'e2', to: 'e4' } });
+  msg = await hGuest.nextType('move');
+  check('Hibernation: move từ host broadcast', msg.san === 'e4', `got=${msg.san}`);
+  await hHost.nextType('move'); // host cũng nhận bản broadcast e4 của chính mình
+  hGuest.send({ type: 'move', move: { from: 'e7', to: 'e5' } });
+  msg = await hHost.nextType('move');
+  check('Hibernation: move từ guest relay tới host', msg.san === 'e5', `got=${msg.san}`);
+  hHost.close();
+  hGuest.close();
+
   console.log(`\n=== KẾT QUẢ: ${passed} PASS, ${failed} FAIL ===`);
   if (failed > 0) {
     console.log('FAIL:', failures.join(', '));
