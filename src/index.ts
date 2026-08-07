@@ -8,7 +8,16 @@ interface Env {
 
 const ROOM_CODE_RE = /^[A-Za-z0-9]{1,20}$/;
 const MAX_MSG_LEN = 4096;
+// Chống spam theo TỪNG người chơi: cùng một socket không được gửi nước đi liên
+// tiếp cách nhau dưới ngưỡng này. Trước đây giới hạn là chung phòng (khoảng cách
+// giữa nước của 2 người) nên ván nhanh (1-3 phút) bị nhầm là spam khi đối thủ
+// trả lời nhanh. Per-socket thì người thật không bao giờ đi 2 nước trong 100ms
+// (lượt luân phiên) -> chỉ chặn được flood script.
 const MOVE_RATE_LIMIT_MS = 100;
+// Cảnh báo nếu một socket gửi quá nhiều nước đi hợp lệ trong 1 giây (bất khả
+// thi với người thật vì lượt đi luân phiên) -> chỉ chặn flood script.
+const MOVE_BURST_MAX = 5;
+const MOVE_BURST_WINDOW_MS = 1000;
 const PROMOTION_TYPES = ['q', 'r', 'b', 'n'];
 
 function json(data: unknown, status = 200): Response {
@@ -39,7 +48,7 @@ export default {
       return stub.fetch(request);
     }
 
-    const staticPath = /^\/(index\.html|css\/|js\/)/.test(url.pathname) ? url.pathname : '/';
+    const staticPath = /^\/(index\.html|css\/|js\/|stockfish\/)/.test(url.pathname) ? url.pathname : '/';
     return env.ASSETS.fetch(new Request(new URL(staticPath, request.url), request));
   },
 };
@@ -47,6 +56,8 @@ export default {
 interface Slot {
   ws: WebSocket;
   color: 'w' | 'b';
+  lastMoveAt: number;
+  moveCount: number[];
 }
 
 interface GameState {
@@ -65,9 +76,48 @@ export class PChessRoom extends DurableObject<Env> {
 
     const url = new URL(request.url);
     const claimedRole = url.searchParams.get('role') === 'guest' ? 'guest' : 'host';
+    const isReconnect = url.searchParams.get('reconnect') === '1';
     const alive = this.ctx.getWebSockets();
 
-    if (alive.length >= 2) {
+    // Dọn slot đã đóng. Client mất kết nối (mobile để nền / thoát tab) có thể
+    // để lại socket cũ chưa được webSocketClose dọn -> nếu cứ đếm sẽ tưởng
+    // "phòng đầy" và từ chối nhầm người đang nối lại.
+    for (let i = 0; i < 2; i++) {
+      const s = this.slots[i];
+      if (s && (s.ws.readyState !== WebSocket.OPEN || !alive.includes(s.ws))) {
+        this.slots[i] = null;
+      }
+    }
+
+    let index = this.slots.findIndex((s) => !s);
+
+    // Chỉ khi đây là KẾT NỐI LẠI (client gửi reconnect=1): nếu socket cũ cùng
+    // vai trò vẫn "sống" ở server (mất mạng không gửi close frame) thì kick nó
+    // để nhường chỗ. Không áp dụng cho người vào mới -> tránh bị chiếm chỗ.
+    // Lưu ý: close() phía server KHÔNG tới client (giới hạn Cloudflare
+    // WebSocketPair), nên phải gửi 'session-takeover' trước để client cũ biết
+    // phiên đã bị thay thế.
+    if (index < 0 && isReconnect) {
+      const roleIdx = claimedRole === 'host' ? 0 : 1;
+      const existing = this.slots[roleIdx];
+      if (existing) {
+        try {
+          existing.ws.send(JSON.stringify({ type: 'session-takeover' }));
+        } catch {
+          /* ignore */
+        }
+        try {
+          existing.ws.close(4000, 'reconnect');
+        } catch {
+          /* ignore */
+        }
+        this.slots[roleIdx] = null;
+        index = roleIdx;
+      }
+    }
+
+    if (index < 0) {
+      // Phòng thật sự đầy: 2 người đang chơi.
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], [claimedRole]);
       // send() ngay trong fetch bị drop vì handshake client chưa xong -> hoãn lại.
@@ -85,20 +135,13 @@ export class PChessRoom extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    let index: number;
-    if (alive.length === 0) {
-      index = claimedRole === 'host' ? 0 : 1;
-    } else {
-      index = this.slots[0] ? 1 : 0;
-    }
-
     const color: 'w' | 'b' = index === 0 ? 'w' : 'b';
     const role = index === 0 ? 'host' : 'guest';
 
     const pair = new WebSocketPair();
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [role]);
-    this.slots[index] = { ws: server, color };
+    this.slots[index] = { ws: server, color, lastMoveAt: 0, moveCount: [] };
 
     // Gửi trạng thái trò chơi đang dở để client nối lại ván (server-authoritative)
     const game = await this.ctx.storage.get<GameState>('game');
@@ -140,8 +183,9 @@ export class PChessRoom extends DurableObject<Env> {
       await this.ctx.storage.delete('game');
     }
 
-    const other = this.opponent(ws);
-    if (other) other.send(JSON.stringify(msg));
+    // Relay tin nhắn giữa 2 người (resign, draw_*, rematch_*, game_over, chat,
+    // sync, init...). Nếu slot đối thủ bị lệch, thử tất cả socket còn sống.
+    this.relayToPeer(ws, msg);
   }
 
   async webSocketClose(ws: WebSocket) {
@@ -166,6 +210,28 @@ export class PChessRoom extends DurableObject<Env> {
     if (i < 0) return null;
     const other = this.slots[1 - i];
     return other && other.ws.readyState === WebSocket.OPEN ? other.ws : null;
+  }
+
+  private relayToPeer(ws: WebSocket, msg: unknown) {
+    const data = JSON.stringify(msg);
+    const other = this.opponent(ws);
+    if (other) {
+      try {
+        other.send(data);
+        return;
+      } catch {
+        /* rơi xuống broadcast */
+      }
+    }
+    for (const s of this.ctx.getWebSockets()) {
+      if (s !== ws && s.readyState === WebSocket.OPEN) {
+        try {
+          s.send(data);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   private broadcast(obj: unknown) {
@@ -216,13 +282,24 @@ export class PChessRoom extends DurableObject<Env> {
       return;
     }
 
-    const now = Date.now();
-    const last = await this.ctx.storage.get<number>('lastMoveAt');
-    if (last && now - last < MOVE_RATE_LIMIT_MS) {
-      reject('rate_limit');
-      return;
+    // Chống spam theo từng socket: người chơi hợp lệ chỉ có thể đi khi tới lượt,
+    // nên cùng socket gửi nước đi nhanh liên tục là flood script.
+    const idx = this.slots.findIndex((s) => s && s.ws === ws);
+    if (idx >= 0) {
+      const slot = this.slots[idx]!;
+      const now = Date.now();
+      if (now - slot.lastMoveAt < MOVE_RATE_LIMIT_MS) {
+        reject('rate_limit');
+        return;
+      }
+      slot.lastMoveAt = now;
+      slot.moveCount = slot.moveCount.filter((t) => now - t < MOVE_BURST_WINDOW_MS);
+      slot.moveCount.push(now);
+      if (slot.moveCount.length > MOVE_BURST_MAX) {
+        reject('rate_limit');
+        return;
+      }
     }
-    await this.ctx.storage.put('lastMoveAt', now);
 
     const promotion = PROMOTION_TYPES.includes(move.promotion || '') ? move.promotion! : undefined;
     let result: { san: string } | null = null;

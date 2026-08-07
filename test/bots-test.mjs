@@ -36,12 +36,13 @@ class Bot {
     this.closed = false;
   }
 
-  connect() {
+  connect(opts = {}) {
     return new Promise((resolve, reject) => {
       const u = new URL(BASE);
       u.pathname = '/room';
       u.searchParams.set('code', this.room);
       u.searchParams.set('role', this.role);
+      if (opts.reconnect) u.searchParams.set('reconnect', '1');
       this.ws = new WebSocket(u.toString());
       this.ws.onopen = () => resolve();
       this.ws.onerror = () => reject(new Error(`${this.name}: ws error`));
@@ -319,6 +320,85 @@ async function main() {
 
   host.close();
   guest3.close();
+
+  // 18) Mobile reconnect: đóng rồi nối lại NGAY với reconnect=1 (mô phỏng
+  //     mobile để nền/đổi mạng). Socket cũ có thể chưa được server dọn nên phòng
+  //     tưởng "đầy" -> server phải kick socket cũ thay vì từ chối.
+  console.log('\n-- Test mobile reconnect (reconnect=1, nối lại ngay) --');
+  const mRoom = 'mobile' + Date.now().toString(36);
+  const mHost = new Bot('MHOST', mRoom, 'host');
+  await mHost.connect();
+  await mHost.nextType('joined');
+  const mGuest = new Bot('MGUEST', mRoom, 'guest');
+  await mGuest.connect();
+  await mGuest.nextType('joined');
+  await mHost.nextType('peer_joined');
+
+  mHost.send({ type: 'move', move: { from: 'e2', to: 'e4' } });
+  const mh = await mHost.nextType('move');
+  await mGuest.nextType('move');
+  check('Mobile: host đi e4', mh.san === 'e4');
+
+  // Đóng socket rồi nối lại ngay (không chờ server dọn close)
+  mGuest.close();
+  const mGuest2 = new Bot('MGUEST2', mRoom, 'guest');
+  await mGuest2.connect({ reconnect: true });
+  msg = await mGuest2.nextType('joined', 8000);
+  check('Mobile: nối lại nhận joined (không bị room-full)', msg.type === 'joined', `got=${msg.type}`);
+  check('Mobile: ván dở khôi phục', msg.game && msg.game.fen === mh.fen, `fen=${msg.game && msg.game.fen}`);
+  msg = await mHost.nextType('peer_joined');
+  check('Mobile: host nhận peer_joined', msg.type === 'peer_joined');
+
+  // 19) Resign + draw relay sau reconnect
+  console.log('\n-- Test relay resign / draw --');
+  mHost.send({ type: 'draw_offer' });
+  msg = await mGuest2.nextType('draw_offer');
+  check('Mobile: guest nhận draw_offer', msg.type === 'draw_offer');
+
+  mGuest2.send({ type: 'draw_accept' });
+  msg = await mHost.nextType('draw_accept');
+  check('Mobile: host nhận draw_accept', msg.type === 'draw_accept');
+
+  mHost.send({ type: 'resign' });
+  msg = await mGuest2.nextType('resign');
+  check('Mobile: guest nhận resign', msg.type === 'resign');
+
+  // 20) Same-role reconnect kick: host nối lại reconnect=1 kick socket host cũ
+  console.log('\n-- Test same-role reconnect (kick socket cũ) --');
+  const kRoom = 'kick' + Date.now().toString(36);
+  const kHost = new Bot('KHOST', kRoom, 'host');
+  await kHost.connect();
+  await kHost.nextType('joined');
+  const kGuest = new Bot('KGUEST', kRoom, 'guest');
+  await kGuest.connect();
+  await kGuest.nextType('joined');
+  await kHost.nextType('peer_joined');
+
+  const kHost2 = new Bot('KHOST2', kRoom, 'host');
+  await kHost2.connect({ reconnect: true });
+  msg = await kHost2.nextType('joined', 8000);
+  check('Kick: host nối lại nhận joined', msg.type === 'joined', `got=${msg.type}`);
+  msg = await kHost.nextAnyOf(['session-takeover', '__closed__', 'room-full'], 8000);
+  check('Kick: socket host cũ bị thông báo session-takeover', msg.type === 'session-takeover', `got=${msg.type}`);
+  kHost2.send({ type: 'move', move: { from: 'e2', to: 'e4' } });
+  msg = await kGuest.nextType('move');
+  check('Kick: host mới đi được (e4 broadcast)', msg.san === 'e4', `got=${msg.san}`);
+  let oldInert = false;
+  try {
+    kHost.send({ type: 'move', move: { from: 'e7', to: 'e5' } });
+    msg = await kHost.nextType('move_rejected');
+    oldInert = msg.reason === 'not_your_turn';
+  } catch (e) {
+    // Socket cũ có thể đã bị đóng sạch (close frame tới) hoặc không -> miễn là
+    // không còn đi được nước là đạt yêu cầu.
+    oldInert = /ws not open|closed|timeout/i.test(String((e && e.message) || e));
+  }
+  check('Kick: socket cũ bị vô hiệu (đóng hoặc not_your_turn)', oldInert);
+
+  mHost.close();
+  mGuest2.close();
+  kHost2.close();
+  kGuest.close();
 
   console.log(`\n=== KẾT QUẢ: ${passed} PASS, ${failed} FAIL ===`);
   if (failed > 0) {

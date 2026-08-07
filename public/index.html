@@ -161,8 +161,14 @@
                                     <button id="btn-rematch" class="btn btn-primary">
                                         <span>🔄 Chơi lại</span>
                                     </button>
+                                    <button id="btn-analyze-game" class="btn btn-secondary">
+                                        <span>🔍 Phân tích</span>
+                                    </button>
                                     <button id="btn-new-game" class="btn btn-secondary">
                                         <span>🏠 Về trang chủ</span>
+                                    </button>
+                                    <button id="btn-export-pgn" class="btn btn-ghost">
+                                        <span>📋 Xuất PGN</span>
                                     </button>
                                 </div>
                             </div>
@@ -333,8 +339,88 @@
                     <button id="btn-menu-settings" class="btn btn-secondary">⚙️ Cài đặt</button>
                     <button id="btn-menu-resign" class="btn btn-danger">🏳️ Đầu hàng</button>
                     <button id="btn-menu-draw" class="btn btn-secondary">🤝 Xin hòa</button>
+                    <button id="btn-menu-analyze" class="btn btn-secondary">🔍 Phân tích ván</button>
+                    <button id="btn-menu-export-pgn" class="btn btn-secondary">📋 Xuất PGN</button>
                     <button class="btn btn-secondary btn-close-modal">❌ Đóng</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- PGN Import Modal -->
+        <div id="pgn-modal" class="modal hidden">
+            <div class="modal-overlay"></div>
+            <div class="modal-content pgn-content">
+                <div class="modal-header">
+                    <h2>📥 Phân tích từ PGN</h2>
+                    <button class="btn btn-icon btn-close-modal">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+                <p>Dán PGN của ván cờ vào đây để phân tích với Stockfish:</p>
+                <textarea id="pgn-input" rows="10" placeholder="1. e4 e5 2. Nf3 Nc6 ..."></textarea>
+                <div class="pgn-actions">
+                    <button id="btn-pgn-analyze" class="btn btn-primary">Phân tích</button>
+                    <button class="btn btn-secondary btn-close-modal">Hủy</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Analysis Page -->
+        <div id="analysis-page" class="page">
+            <header class="analysis-header">
+                <div class="analysis-title">
+                    <button id="btn-analysis-back" class="btn btn-icon" title="Thoát phân tích">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M15 18l-6-6 6-6"></path>
+                        </svg>
+                    </button>
+                    <h1>🔍 Phân tích</h1>
+                    <span id="analysis-engine-status" class="analysis-engine-status">Đang tải Stockfish...</span>
+                </div>
+                <div class="analysis-actions">
+                    <button id="btn-analysis-pgn" class="btn btn-secondary">📥 Nhập PGN</button>
+                    <button id="btn-analysis-export" class="btn btn-secondary">📋 Xuất PGN</button>
+                </div>
+            </header>
+
+            <div class="analysis-layout">
+                <div class="analysis-board-wrap">
+                    <div class="analysis-board-container">
+                        <div id="analysis-board" class="chess-board"></div>
+                        <div class="analysis-eval-bar">
+                            <div class="eval-fill" id="analysis-eval-fill"></div>
+                            <span id="analysis-eval-text">+0.0</span>
+                        </div>
+                    </div>
+
+                    <div class="analysis-controls">
+                        <button id="btn-an-first" class="btn btn-icon" title="Về đầu">⏮</button>
+                        <button id="btn-an-prev" class="btn btn-icon" title="Nước trước">◀</button>
+                        <span id="analysis-position-label" class="analysis-pos-label">0/0</span>
+                        <button id="btn-an-next" class="btn btn-icon" title="Nước sau">▶</button>
+                        <button id="btn-an-last" class="btn btn-icon" title="Đến cuối">⏭</button>
+                    </div>
+
+                    <div class="analysis-bestmove" id="analysis-bestmove">Chờ Stockfish phân tích...</div>
+                </div>
+
+                <aside class="analysis-panel">
+                    <div class="panel-section">
+                        <h3>Biến tốt nhất</h3>
+                        <div id="analysis-pv" class="analysis-pv">—</div>
+                    </div>
+                    <div class="panel-section">
+                        <h3>Nước đi & Đánh giá</h3>
+                        <div id="analysis-movelist" class="analysis-movelist"></div>
+                    </div>
+                    <div class="panel-section">
+                        <h3>PGN</h3>
+                        <textarea id="analysis-pgn-text" class="analysis-pgn-text" readonly rows="6"></textarea>
+                    </div>
+                </aside>
             </div>
         </div>
 

@@ -48,15 +48,17 @@ class SoundManager {
         this.ensureContext();
 
         switch (type) {
-            case 'move': this.playTone(400, 0.08, 'sine', 0.15); break;
-            case 'capture': this.playNoise(0.1, 0.2); break;
-            case 'check': this.playTone(600, 0.15, 'square', 0.2); break;
+            case 'move': this.playTone(520, 0.07, 'triangle', 0.18); break;
+            case 'capture': this.playNoise(0.09, 0.28); this.playTone(150, 0.12, 'triangle', 0.22); break;
+            case 'check': this.playTone(660, 0.16, 'square', 0.16); this.playTone(880, 0.16, 'square', 0.12); break;
             case 'checkmate': this.playMelody([523, 659, 784], [0.2, 0.2, 0.4]); break;
-            case 'castle': this.playTone(350, 0.12, 'sine', 0.15); break;
-            case 'promote': this.playMelody([440, 554, 659], [0.15, 0.15, 0.3]); break;
-            case 'draw': this.playTone(440, 0.3, 'sine', 0.15); break;
-            case 'notify': this.playTone(520, 0.1, 'sine', 0.1); break;
+            case 'castle': this.playTone(330, 0.1, 'sine', 0.16); this.playTone(440, 0.1, 'sine', 0.14); break;
+            case 'promote': this.playMelody([392, 523, 659, 784], [0.12, 0.12, 0.12, 0.28]); break;
+            case 'draw': this.playMelody([440, 494, 523], [0.2, 0.2, 0.35]); break;
+            case 'notify': this.playTone(560, 0.12, 'sine', 0.12); break;
             case 'error': this.playTone(200, 0.2, 'sawtooth', 0.1); break;
+            case 'lowtime': this.playTone(880, 0.06, 'square', 0.12); break;
+            case 'flag': this.playMelody([660, 330, 165], [0.15, 0.15, 0.4]); break;
         }
     }
 
@@ -272,7 +274,7 @@ const DebugPanel = {
             this.log('info', ['WS vẫn open, không cần reconnect']);
             return;
         }
-        g.connectRoom(g.roomId, g.role || (g.isHost ? 'host' : 'guest'));
+        g.connectRoom(g.roomId, g.role || (g.isHost ? 'host' : 'guest'), true);
         this.log('info', ['Đang reconnect WS...']);
     }
 };
@@ -402,6 +404,18 @@ class PChessGame {
         document.getElementById('btn-menu-resign').addEventListener('click', () => this.resign());
         document.getElementById('btn-menu-draw').addEventListener('click', () => this.offerDraw());
 
+        // Analysis & PGN
+        document.getElementById('btn-analyze-game').addEventListener('click', () => this.startAnalysis());
+        document.getElementById('btn-menu-analyze').addEventListener('click', () => {
+            this.closeModal(document.getElementById('menu-modal'));
+            this.startAnalysis();
+        });
+        document.getElementById('btn-export-pgn').addEventListener('click', () => this.exportPgn());
+        document.getElementById('btn-menu-export-pgn').addEventListener('click', () => {
+            this.closeModal(document.getElementById('menu-modal'));
+            this.exportPgn();
+        });
+
         // Sync settings UI
         this.syncSettingsUI();
     }
@@ -419,13 +433,15 @@ class PChessGame {
     }
 
     // ===== WebSocket Setup =====
-    connectRoom(roomCode, role) {
+    connectRoom(roomCode, role, reconnect = false) {
         return new Promise((resolve, reject) => {
             try {
-                debugLog('info', 'Kết nối WS tới phòng', roomCode, 'role =', role);
+                debugLog('info', 'Kết nối WS tới phòng', roomCode, 'role =', role, reconnect ? '(reconnect)' : '');
                 this.roomId = roomCode;
                 this.role = role;
-                const wsUrl = CONFIG.WS_URL + '/room?code=' + encodeURIComponent(roomCode) + '&role=' + role;
+                this.reconnecting = reconnect;
+                const wsUrl = CONFIG.WS_URL + '/room?code=' + encodeURIComponent(roomCode) +
+                    '&role=' + role + (reconnect ? '&reconnect=1' : '');
                 this.ws = new WebSocket(wsUrl);
 
                 let settled = false;
@@ -447,6 +463,7 @@ class PChessGame {
                     debugLog('info', 'WS open');
                     this.wsOpen = true;
                     this.reconnectAttempts = 0;
+                    this.reconnecting = false;
                     this.startHeartbeat();
                     resolve(roomCode);
                 };
@@ -504,12 +521,7 @@ class PChessGame {
         if (this.gameActive && this.reconnectAttempts < 5) {
             showToast('Mất kết nối, đang thử kết nối lại...', 'warning');
             this.reconnectAttempts++;
-            setTimeout(() => {
-                if (this.roomId && this.role) {
-                    debugLog('warn', 'Reconnect lần', this.reconnectAttempts, 'tới', this.roomId);
-                    this.connectRoom(this.roomId, this.role);
-                }
-            }, CONFIG.RECONNECT_DELAY);
+            this.scheduleReconnect();
         } else if (this.gameActive) {
             showToast('Không thể kết nối lại. Vui lòng tạo phòng mới.', 'error');
             this.leaveRoom();
@@ -520,6 +532,14 @@ class PChessGame {
             this.showPage('lobby-page', false);
             this.showPage('landing-page', true);
         }
+    }
+
+    scheduleReconnect() {
+        setTimeout(() => {
+            if (!this.roomId || !this.role) return;
+            debugLog('warn', 'Reconnect lần', this.reconnectAttempts, 'tới', this.roomId);
+            this.connectRoom(this.roomId, this.role, true);
+        }, CONFIG.RECONNECT_DELAY);
     }
 
     // ===== Room Management =====
@@ -670,11 +690,14 @@ class PChessGame {
             try {
                 debugLog('log', 'Gửi →', data.type);
                 this.ws.send(JSON.stringify(data));
+                return true;
             } catch (err) {
                 debugLog('error', 'Send error:', err);
+                return false;
             }
         } else {
             debugLog('warn', 'Không gửi được', data.type, '- WS chưa mở hoặc không tồn tại');
+            return false;
         }
     }
 
@@ -703,6 +726,9 @@ class PChessGame {
                 break;
             case 'room-full':
                 this.handleRoomFull();
+                break;
+            case 'session-takeover':
+                this.handleSessionTakeover();
                 break;
             case 'sync':
                 this.handleSync(msg);
@@ -843,8 +869,48 @@ class PChessGame {
     }
 
     handleRoomFull() {
+        // Nếu đang nối lại (hoặc đã có phiên phòng trong sessionStorage), đừng
+        // xoá session: socket cũ chưa được server dọn nên phòng "tạm đầy".
+        // Thử lại vài lần, server sẽ dọn slot cũ rồi cho vào.
+        const hasSession = !!(this.roomId && this.role) || !!sessionStorage.getItem('pchess_room');
+        if (hasSession && this.reconnectAttempts < 8) {
+            this.reconnectAttempts++;
+            showToast('Phòng đang đầy, thử kết nối lại (' + this.reconnectAttempts + '/8)...', 'warning');
+            if (this.ws) {
+                this.ws.onclose = null;
+                try {
+                    this.ws.close(1000, 'room-full');
+                } catch (e) { /* ignore */ }
+            }
+            this.ws = null;
+            setTimeout(() => this.scheduleReconnect(), CONFIG.RECONNECT_DELAY);
+            return;
+        }
+
         showToast('Phòng đã đầy! (tối đa 2 người)', 'error');
         this.cleanup();
+        this.showPage('lobby-page', false);
+        this.showPage('landing-page', true);
+        sessionStorage.removeItem('pchess_room');
+    }
+
+    handleSessionTakeover() {
+        // Phiên này đã bị thay thế bởi một kết nối cùng vai trò khác (thường là
+        // người dùng mở lại trang sau khi mất mạng). Dừng ván và thoát gọn,
+        // không tự reconnect vì socket mới đã nắm vai trò này.
+        debugLog('warn', 'Phiên bị thay thế (session-takeover)');
+        showToast('Phiên này đã được mở ở nơi khác', 'warning');
+        if (this.ws) {
+            this.ws.onclose = null;
+            try {
+                this.ws.close(1000, 'takeover');
+            } catch (e) { /* ignore */ }
+            this.ws = null;
+        }
+        this.wsOpen = false;
+        this.stopTimer();
+        this.cleanup();
+        this.showPage('game-page', false);
         this.showPage('lobby-page', false);
         this.showPage('landing-page', true);
         sessionStorage.removeItem('pchess_room');
@@ -885,6 +951,7 @@ class PChessGame {
             promotion: msg.move.promotion
         };
 
+        const capturedPiece = this.chess.get(msg.move.to);
         const result = this.chess.move(moveObj);
         if (!result) {
             showToast('Nước đi bất hợp lệ, đồng bộ lại...', 'warning');
@@ -910,6 +977,7 @@ class PChessGame {
 
         this.updateGameStatus();
         this.renderBoard();
+        this.animatePieceMove(msg.move.from, msg.move.to, capturedPiece);
         this.updateMoveList();
         this.updateCapturedPieces();
 
@@ -1143,6 +1211,34 @@ class PChessGame {
         return null;
     }
 
+    animatePieceMove(from, to, captured) {
+        if (this.settings.animation === false) return;
+        const fromEl = document.querySelector(`.square[data-square="${from}"]`);
+        const toEl = document.querySelector(`.square[data-square="${to}"]`);
+        if (!fromEl || !toEl) return;
+
+        // Nhấp nháy ô đích
+        toEl.classList.add(captured ? 'capture-flash' : 'move-flash');
+        setTimeout(() => {
+            toEl.classList.remove('capture-flash', 'move-flash');
+        }, 350);
+
+        // Trượt quân từ ô `from` về ô `to` (toạ độ màn hình, không phụ thuộc xoay bàn)
+        const piece = toEl.querySelector('.piece-img');
+        if (!piece || typeof piece.animate !== 'function') return;
+        const r1 = fromEl.getBoundingClientRect();
+        const r2 = toEl.getBoundingClientRect();
+        const dx = r1.left - r2.left;
+        const dy = r1.top - r2.top;
+        piece.animate(
+            [
+                { transform: `translate(${dx}px, ${dy}px)` },
+                { transform: 'translate(0px, 0px)' }
+            ],
+            { duration: 180, easing: 'cubic-bezier(0.2, 0.6, 0.35, 1)' }
+        );
+    }
+
     // ===== Move Handling =====
     handleSquareClick(square) {
         if (!this.gameActive) return;
@@ -1340,11 +1436,20 @@ class PChessGame {
         } else {
             selfTimer.classList.remove('warning');
         }
+
+        // Âm thanh nhắc hết giờ (1 lần)
+        if (selfTime === 10 && this._lowWarned !== this.currentTurn) {
+            this._lowWarned = this.currentTurn;
+            this.soundManager.play('lowtime');
+        } else if (selfTime > 10) {
+            this._lowWarned = null;
+        }
     }
 
     handleTimeout() {
         const loser = this.currentTurn;
         const winner = loser === 'w' ? 'b' : 'w';
+        this.soundManager.play('flag');
         this.sendMessage({
             type: 'game_over',
             reason: 'timeout',
@@ -1431,6 +1536,61 @@ class PChessGame {
         modal.classList.remove('hidden');
     }
 
+    // ===== Analysis & PGN =====
+    startAnalysis() {
+        document.getElementById('gameover-modal').classList.add('hidden');
+        const moves = this.moveHistory || [];
+        const result = this.gameResult || { winner: null, reason: 'game', message: '*' };
+        Analysis.startFromGame(moves, result);
+        this.showPage('game-page', false);
+        this.showPage('analysis-page', true);
+    }
+
+    buildPgn(moves, result) {
+        const resultTag = result && result.winner === 'w' ? '1-0' :
+            (result && result.winner === 'b' ? '0-1' : (result && result.winner === null ? '1/2-1/2' : '*'));
+        const now = new Date();
+        const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '.');
+        let movesStr = '';
+        for (let i = 0; i < moves.length; i++) {
+            if (i % 2 === 0) movesStr += (i / 2 + 1) + '. ';
+            movesStr += moves[i] + ' ';
+        }
+        movesStr += resultTag;
+        return [
+            '[Event "PChess"]',
+            '[Site "PChess"]',
+            '[Date "' + dateStr + '"]',
+            '[Round "-"]',
+            '[White "Player 1"]',
+            '[Black "Player 2"]',
+            '[Result "' + resultTag + '"]',
+            '',
+            movesStr
+        ].join('\n');
+    }
+
+    exportPgn() {
+        const pgn = this.buildPgn(this.moveHistory || [], this.gameResult || null);
+        this.copyTextToClipboard(pgn);
+        showToast('Đã copy PGN vào clipboard', 'success');
+    }
+
+    copyTextToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(() => {});
+            return;
+        }
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+    }
+
     // ===== Rematch =====
     requestRematch() {
         document.getElementById('gameover-modal').classList.add('hidden');
@@ -1515,7 +1675,11 @@ class PChessGame {
 
         if (!confirm('Bạn có chắc muốn đầu hàng?')) return;
 
-        this.sendMessage({ type: 'resign' });
+        const sent = this.sendMessage({ type: 'resign' });
+        if (!sent) {
+            showToast('Mất kết nối, không gửi được yêu cầu đầu hàng', 'error');
+            return;
+        }
         this.gameResult = {
             winner: this.myColor === 'w' ? 'b' : 'w',
             reason: 'resign',
@@ -1526,6 +1690,7 @@ class PChessGame {
     }
 
     handleResign() {
+        if (!this.gameActive) return;
         this.gameResult = {
             winner: this.myColor,
             reason: 'resign',
@@ -1537,8 +1702,12 @@ class PChessGame {
 
     offerDraw() {
         if (!this.gameActive) return;
-        this.sendMessage({ type: 'draw_offer' });
-        showToast('Đã gửi đề nghị hòa', 'info');
+        const sent = this.sendMessage({ type: 'draw_offer' });
+        if (sent) {
+            showToast('Đã gửi đề nghị hòa', 'info');
+        } else {
+            showToast('Mất kết nối, không gửi được đề nghị hòa', 'error');
+        }
         this.closeModal(document.getElementById('menu-modal'));
     }
 
@@ -1718,4 +1887,403 @@ class PChessGame {
 document.addEventListener('DOMContentLoaded', () => {
     window.game = new PChessGame();
     DebugPanel.init();
+    Analysis.init();
 });
+
+// ===== Phân tích ván cờ với Stockfish 18 (WASM) =====
+const Analysis = {
+    engine: null,
+    ready: false,
+    failed: false,
+    pgnMoves: [],
+    result: null,
+    index: -1,
+    evals: {},
+    pendingPly: null,
+    posChess: new Chess(),
+
+    init() {
+        document.getElementById('btn-analysis-back').addEventListener('click', () => this.exit());
+        document.getElementById('btn-analysis-pgn').addEventListener('click', () => {
+            document.getElementById('pgn-modal').classList.remove('hidden');
+        });
+        document.getElementById('btn-pgn-analyze').addEventListener('click', () => this.importFromPgnInput());
+        document.getElementById('btn-analysis-export').addEventListener('click', () => this.exportPgn());
+        document.getElementById('btn-an-first').addEventListener('click', () => this.goTo(0));
+        document.getElementById('btn-an-prev').addEventListener('click', () => this.goTo(this.index - 1));
+        document.getElementById('btn-an-next').addEventListener('click', () => this.goTo(this.index + 1));
+        document.getElementById('btn-an-last').addEventListener('click', () => this.goTo(this.pgnMoves.length));
+    },
+
+    startFromGame(moves, result) {
+        this.pgnMoves = moves.slice();
+        this.result = result;
+        this.evals = {};
+        this.index = -1;
+        this.setEngineStatus('Đang tải Stockfish...');
+        this.ensureEngine();
+        this.goTo(0);
+    },
+
+    importFromPgnInput() {
+        const text = document.getElementById('pgn-input').value.trim();
+        if (!text) {
+            showToast('Hãy dán PGN vào trước', 'warning');
+            return;
+        }
+        try {
+            const ch = new Chess();
+            ch.load_pgn(text);
+            const moves = ch.history();
+            if (!moves.length) throw new Error('Không có nước đi nào');
+            this.pgnMoves = moves;
+            this.result = null;
+            this.evals = {};
+            this.index = -1;
+            document.getElementById('pgn-modal').classList.add('hidden');
+            document.getElementById('pgn-input').value = '';
+            this.setEngineStatus('Đang tải Stockfish...');
+            this.ensureEngine();
+            this.goTo(0);
+            this.show();
+            showToast('Đã nạp PGN: ' + moves.length + ' nước', 'success');
+        } catch (err) {
+            showToast('PGN không hợp lệ: ' + err.message, 'error');
+        }
+    },
+
+    show() {
+        document.getElementById('game-page').classList.remove('active');
+        document.getElementById('analysis-page').classList.add('active');
+    },
+
+    exit() {
+        document.getElementById('analysis-page').classList.remove('active');
+        document.getElementById('landing-page').classList.add('active');
+        this.stopEngine();
+    },
+
+    ensureEngine() {
+        if (this.engine || this.failed) return;
+        try {
+            this.engine = new Worker('stockfish/stockfish-18-lite-single.js');
+        } catch (err) {
+            this.engineFailed('Không tạo được worker: ' + err.message);
+            return;
+        }
+        this.engine.onerror = (e) => {
+            this.engineFailed('Stockfish lỗi: ' + (e.message || 'worker error'));
+        };
+        this.engine.onmessage = (e) => this.onEngineMessage(e.data);
+        this.engine.postMessage('uci');
+        this.engine.postMessage('isready');
+        // Timeout nếu engine không sẵn sàng
+        setTimeout(() => {
+            if (!this.ready && !this.failed) {
+                this.engineFailed('Stockfish không phản hồi (tải WASM quá lâu). Thử lại sau.');
+            }
+        }, 30000);
+    },
+
+    engineFailed(msg) {
+        this.failed = true;
+        this.setEngineStatus('⚠️ ' + msg, true);
+        if (this.engine) {
+            try { this.engine.terminate(); } catch (e) { /* ignore */ }
+            this.engine = null;
+        }
+    },
+
+    stopEngine() {
+        if (this.engine) {
+            try {
+                this.engine.postMessage('quit');
+                this.engine.terminate();
+            } catch (e) { /* ignore */ }
+            this.engine = null;
+        }
+        this.ready = false;
+        this.failed = false;
+    },
+
+    onEngineMessage(data) {
+        if (typeof data !== 'string') return;
+        if (data === 'uciok') {
+            this.engine.postMessage('isready');
+            return;
+        }
+        if (data === 'readyok') {
+            this.ready = true;
+            this.failed = false;
+            this.setEngineStatus('Stockfish 18 sẵn sàng');
+            this.analyzeCurrent();
+            return;
+        }
+        if (data.indexOf('info depth') === 0) {
+            const ply = this.pendingPly;
+            if (ply == null) return;
+            const score = this.parseScore(data);
+            const pv = this.parsePv(data);
+            if (score != null) {
+                this.evals[ply] = { score, pv, depth: this.parseDepth(data) };
+            }
+            if (ply === this.index) this.renderEval(ply);
+            return;
+        }
+        if (data.indexOf('bestmove') === 0) {
+            const ply = this.pendingPly;
+            if (ply != null && ply === this.index) {
+                this.renderEval(ply);
+            }
+            this.pendingPly = null;
+        }
+    },
+
+    parseScore(line) {
+        const m = line.match(/score (cp|mate) (-?\d+)/);
+        if (!m) return null;
+        if (m[1] === 'mate') {
+            const moves = parseInt(m[2], 10);
+            return { type: 'mate', value: moves };
+        }
+        return { type: 'cp', value: parseInt(m[2], 10) };
+    },
+
+    parseDepth(line) {
+        const m = line.match(/depth (\d+)/);
+        return m ? parseInt(m[1], 10) : null;
+    },
+
+    parsePv(line) {
+        const m = line.match(/ pv (.+)$/);
+        if (!m) return [];
+        const ucis = m[1].trim().split(/\s+/);
+        const ch = this.posChess.clone();
+        const sans = [];
+        for (const u of ucis) {
+            if (u.length < 4) break;
+            try {
+                const mv = ch.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u.length > 4 ? u[4] : undefined });
+                if (mv) sans.push(mv.san);
+                else break;
+            } catch (e) {
+                break;
+            }
+        }
+        return sans;
+    },
+
+    goTo(idx) {
+        const maxIdx = this.pgnMoves.length;
+        idx = Math.max(0, Math.min(idx, maxIdx));
+        if (idx === this.index && this.pgnMoves.length) {
+            this.analyzeCurrent();
+            return;
+        }
+        this.index = idx;
+
+        // Dựng lại vị trí bằng cách chơi lại các nước
+        this.posChess = new Chess();
+        for (let i = 0; i < idx; i++) {
+            try {
+                this.posChess.move(this.pgnMoves[i]);
+            } catch (e) {
+                break;
+            }
+        }
+
+        document.getElementById('analysis-position-label').textContent = idx + '/' + maxIdx;
+        this.renderBoard();
+        this.renderMoveList();
+        this.renderPgnText();
+        this.analyzeCurrent();
+    },
+
+    analyzeCurrent() {
+        if (!this.ready || this.index < 0 || this.index > this.pgnMoves.length) return;
+        // Stockfish cần UCI (e2e4), chuyển từ SAN
+        const ucis = [];
+        const ch = new Chess();
+        for (let i = 0; i < this.index; i++) {
+            try {
+                const mv = ch.move(this.pgnMoves[i]);
+                if (mv) ucis.push(mv.from + mv.to + (mv.promotion || ''));
+            } catch (e) {
+                break;
+            }
+        }
+        const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
+        this.pendingPly = this.index;
+        this.engine.postMessage(cmd);
+        this.engine.postMessage('go depth 16');
+        document.getElementById('analysis-bestmove').textContent =
+            (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
+    },
+
+    renderEval(ply) {
+        const ev = this.evals[ply];
+        if (!ev || ply !== this.index) return;
+        const text = this.formatScore(ev.score);
+        document.getElementById('analysis-eval-text').textContent = text;
+
+        const fill = document.getElementById('analysis-eval-fill');
+        let pct = 50;
+        if (ev.score.type === 'mate') {
+            pct = ev.score.value > 0 ? 96 : 4;
+        } else {
+            const cp = ev.score.value;
+            pct = 50 + Math.max(-46, Math.min(46, cp / 120 * 46));
+        }
+        fill.style.height = pct + '%';
+        fill.style.background = pct >= 50
+            ? 'linear-gradient(to top, #fafafa, #e0e0e0)'
+            : 'linear-gradient(to top, #3a3a3a, #555555)';
+
+        const best = document.getElementById('analysis-bestmove');
+        if (ev.pv && ev.pv.length) {
+            const side = this.posChess.turn() === 'w' ? 'Trắng' : 'Đen';
+            best.textContent = 'Tốt nhất: ' + ev.pv[0] +
+                ' (' + side + ')  ·  ' + text + (ev.depth ? '  ·  depth ' + ev.depth : '');
+        } else {
+            best.textContent = text + (ev.depth ? '  ·  depth ' + ev.depth : '');
+        }
+
+        const cells = document.querySelectorAll('.ml-eval');
+        cells[ply] && (cells[ply].textContent = text);
+    },
+
+    formatScore(score) {
+        if (!score) return '';
+        if (score.type === 'mate') return (score.value > 0 ? 'M' : '-M') + Math.abs(score.value);
+        const pawns = score.value / 100;
+        const s = pawns.toFixed(1);
+        return (pawns > 0 ? '+' : '') + s;
+    },
+
+    renderBoard() {
+        const board = document.getElementById('analysis-board');
+        board.innerHTML = '';
+        const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+        const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
+        let lastFrom = null, lastTo = null;
+        if (this.index > 0 && this.index <= this.pgnMoves.length) {
+            const ch = new Chess();
+            try {
+                for (let i = 0; i < this.index; i++) ch.move(this.pgnMoves[i]);
+                const last = ch.history({ verbose: true })[ch.history().length - 1];
+                lastFrom = last.from;
+                lastTo = last.to;
+            } catch (e) { /* ignore */ }
+        }
+        const inCheck = this.posChess.in_check();
+        const kingSquare = inCheck ? this.findKingSquare(this.posChess, this.posChess.turn()) : null;
+
+        for (let r = 0; r < 8; r++) {
+            for (let f = 0; f < 8; f++) {
+                const square = document.createElement('div');
+                const file = files[f];
+                const rank = ranks[r];
+                const squareName = file + rank;
+                const isLight = (r + f) % 2 === 0;
+                square.className = `square ${isLight ? 'light' : 'dark'}`;
+                square.dataset.square = squareName;
+
+                const piece = this.posChess.get(squareName);
+                if (piece) {
+                    const pieceEl = document.createElement('img');
+                    pieceEl.className = `piece ${piece.color} piece-img`;
+                    pieceEl.src = getPieceUrl(piece.color, piece.type);
+                    pieceEl.alt = piece.color + piece.type;
+                    pieceEl.draggable = false;
+                    square.appendChild(pieceEl);
+                }
+
+                if (squareName === lastFrom || squareName === lastTo) {
+                    square.classList.add('last-move');
+                }
+                if (squareName === kingSquare) {
+                    square.classList.add('check');
+                }
+                board.appendChild(square);
+            }
+        }
+    },
+
+    findKingSquare(chess, color) {
+        const b = chess.board();
+        const files = 'abcdefgh', ranks = '87654321';
+        for (let r = 0; r < 8; r++) {
+            for (let f = 0; f < 8; f++) {
+                const p = b[r][f];
+                if (p && p.type === 'k' && p.color === color) return files[f] + ranks[r];
+            }
+        }
+        return null;
+    },
+
+    renderMoveList() {
+        const list = document.getElementById('analysis-movelist');
+        list.innerHTML = '';
+        for (let i = 0; i < this.pgnMoves.length; i += 2) {
+            const num = document.createElement('span');
+            num.className = 'ml-num';
+            num.textContent = (i / 2 + 1) + '.';
+
+            const w = document.createElement('span');
+            w.className = 'ml-move' + (this.index === i + 1 ? ' active' : '');
+            w.textContent = this.pgnMoves[i];
+            w.addEventListener('click', () => this.goTo(i + 1));
+
+            const b = document.createElement('span');
+            b.className = 'ml-move' + (this.index === i + 2 ? ' active' : '');
+            b.textContent = this.pgnMoves[i + 1] || '';
+            b.addEventListener('click', () => this.goTo(i + 2));
+
+            const ev = document.createElement('span');
+            ev.className = 'ml-eval';
+            ev.textContent = this.formatScore(this.evals[i + 1] && this.evals[i + 1].score);
+
+            list.appendChild(num);
+            list.appendChild(w);
+            list.appendChild(b);
+            list.appendChild(ev);
+        }
+    },
+
+    renderPgnText() {
+        let s = '';
+        for (let i = 0; i < this.pgnMoves.length; i++) {
+            if (i % 2 === 0) s += (i / 2 + 1) + '. ';
+            s += this.pgnMoves[i] + ' ';
+        }
+        document.getElementById('analysis-pgn-text').value = s.trim();
+    },
+
+    exportPgn() {
+        const text = document.getElementById('analysis-pgn-text').value;
+        if (!text) {
+            showToast('Chưa có ván cờ nào để xuất', 'warning');
+            return;
+        }
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(() => {});
+        } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+        }
+        showToast('Đã copy PGN vào clipboard', 'success');
+    },
+
+    setEngineStatus(text, error) {
+        const el = document.getElementById('analysis-engine-status');
+        el.textContent = text;
+        el.classList.toggle('ready', !error);
+    }
+};
+
