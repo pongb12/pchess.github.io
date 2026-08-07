@@ -4,7 +4,7 @@ compatibility_date = "2026-08-06"
 
 # Static assets: worker serve qua binding ASSETS (chỉ index.html, css, js)
 [assets]
-directory = "."
+directory = "public"
 binding = "ASSETS"
 
 # Durable Object: relay WebSocket + validate nước đi (server-authoritative)

@@ -73,24 +73,36 @@ class Bot {
 
   async nextType(type, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const m = await this.next(Math.max(100, deadline - Date.now()));
+    for (;;) {
+      if (this.pending && this.pending.length) {
+        const m = this.pending.shift();
+        if (m.type === type) return m;
+        continue;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`${this.name}: timeout waiting ${type}`);
+      const m = await this.next(remaining);
       if (m.type === type) return m;
       if (m.type === '__closed__') throw new Error(`${this.name}: closed before ${type}`);
-      this.queue.unshift(m);
+      (this.pending = this.pending || []).push(m);
     }
-    throw new Error(`${this.name}: timeout waiting ${type}`);
   }
 
   async nextAnyOf(types, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const m = await this.next(Math.max(100, deadline - Date.now()));
+    for (;;) {
+      if (this.pending && this.pending.length) {
+        const m = this.pending.shift();
+        if (types.includes(m.type)) return m;
+        continue;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`${this.name}: timeout waiting ${types.join('/')}`);
+      const m = await this.next(remaining);
       if (types.includes(m.type)) return m;
       if (m.type === '__closed__') throw new Error(`${this.name}: closed before ${types.join('/')}`);
-      this.queue.unshift(m);
+      (this.pending = this.pending || []).push(m);
     }
-    throw new Error(`${this.name}: timeout waiting ${types.join('/')}`);
   }
 
   send(obj) {
@@ -274,30 +286,39 @@ async function main() {
   console.log('\n-- Test room-full --');
   const third = new Bot('THIRD', room, 'guest');
   await third.connect();
-  msg = await third.nextAnyOf(['room-full', '__closed__'], 8000);
+  msg = await third.nextType('room-full', 8000);
   check('THIRD: phòng đầy được thông báo', msg.type === 'room-full', `got=${msg.type}`);
-  if (msg.type === 'room-full') {
-    msg = await third.nextType('__closed__', 5000);
-    check('THIRD: server đóng socket sau room-full', msg.type === '__closed__', `got=${msg.type}`);
-  }
 
-  // 15) Rematch: cả 2 đồng ý -> server xóa ván
+  // Giống handleRoomFull: client tự đóng socket của mình
+  third.close();
+  await wait(300);
+
+  // Verify phòng KHÔNG bị socket thứ 3 làm hỏng: guest2 rời -> guest3 vào vẫn được
+  console.log('-- Verify phòng không bị socket thứ 3 làm hỏng --');
+  guest2.close();
+  await host.nextType('peer_left');
+  const guest3 = new Bot('GUEST3', room, 'guest');
+  await guest3.connect();
+  msg = await guest3.nextType('joined', 8000);
+  check('GUEST3: vào phòng bình thường (không bị room-full)', msg.type === 'joined' && msg.role === 'guest', `got=${msg.type}`);
+
+  // 16) Rematch: cả 2 đồng ý -> server xóa ván
   console.log('\n-- Test rematch --');
   host.send({ type: 'rematch_accept' });
-  guest2.send({ type: 'rematch_accept' });
+  guest3.send({ type: 'rematch_accept' });
   await wait(150);
   host.send({ type: 'sync_request' });
   msg = await host.nextType('sync');
   check('HOST: sync sau rematch = vị trí khởi đầu', msg.fen === new Chess().fen(), msg.fen);
   check('HOST: history rỗng sau rematch', Array.isArray(msg.history) && msg.history.length === 0, `len=${msg.history.length}`);
 
-  // 16) Relay chat verbatim
+  // 17) Relay chat verbatim
   host.send({ type: 'chat', text: 'xin chào' });
-  msg = await guest2.nextType('chat');
-  check('GUEST2: nhận chat relay', msg.text === 'xin chào');
+  msg = await guest3.nextType('chat');
+  check('GUEST3: nhận chat relay', msg.text === 'xin chào');
 
   host.close();
-  guest2.close();
+  guest3.close();
 
   console.log(`\n=== KẾT QUẢ: ${passed} PASS, ${failed} FAIL ===`);
   if (failed > 0) {

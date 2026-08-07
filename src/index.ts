@@ -70,8 +70,10 @@ export class PChessRoom extends DurableObject<Env> {
     if (alive.length >= 2) {
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], [claimedRole]);
-      // Chưa thể send()/close() ngay: handshake phía client chưa hoàn tất nên
-      // Cloudflare sẽ drop message và close frame. Hoãn lại để socket ổn định.
+      // send() ngay trong fetch bị drop vì handshake client chưa xong -> hoãn lại.
+      // Lưu ý: close() phía server sẽ gỡ socket khỏi DO (tránh phòng bị kẹt) dù
+      // close frame có thể không tới client (giới hạn của Cloudflare WebSocketPair);
+      // client tự đóng socket khi nhận 'room-full' (handleRoomFull).
       setTimeout(() => {
         try {
           pair[1].send(JSON.stringify({ type: 'room-full' }));
