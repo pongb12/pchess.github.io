@@ -428,7 +428,22 @@ class PChessGame {
                 const wsUrl = CONFIG.WS_URL + '/room?code=' + encodeURIComponent(roomCode) + '&role=' + role;
                 this.ws = new WebSocket(wsUrl);
 
+                let settled = false;
+                // Không để "Đang kết nối..." treo vô thời hạn
+                const timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    debugLog('error', 'Timeout kết nối WS (10s)');
+                    if (this.ws) {
+                        try { this.ws.close(); } catch (e) { /* ignore */ }
+                    }
+                    reject(new Error('timeout'));
+                }, 10000);
+
                 this.ws.onopen = () => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
                     debugLog('info', 'WS open');
                     this.wsOpen = true;
                     this.reconnectAttempts = 0;
@@ -438,7 +453,14 @@ class PChessGame {
 
                 this.ws.onmessage = (event) => this.onWsMessage(event);
 
-                this.ws.onclose = (event) => this.handleWsClose(event);
+                this.ws.onclose = (event) => {
+                    if (!settled) {
+                        settled = true;
+                        clearTimeout(timer);
+                        reject(new Error('ws_closed'));
+                    }
+                    this.handleWsClose(event);
+                };
 
                 this.ws.onerror = (err) => {
                     debugLog('error', 'WS error:', err && err.message ? err.message : '');

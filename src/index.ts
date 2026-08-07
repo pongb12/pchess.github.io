@@ -3,6 +3,7 @@ import { Chess } from '../lib/chess.js';
 
 interface Env {
   PCHESS_ROOM: DurableObjectNamespace;
+  ASSETS: Fetcher;
 }
 
 const ROOM_CODE_RE = /^[A-Za-z0-9]{1,20}$/;
@@ -27,18 +28,19 @@ export default {
     if (url.pathname === '/health') {
       return json({ ok: true });
     }
-    if (url.pathname !== '/room') {
-      return json({ error: 'not_found' }, 404);
+    if (url.pathname === '/room') {
+      const code = (url.searchParams.get('code') || '').trim();
+      if (!ROOM_CODE_RE.test(code)) {
+        return json({ error: 'invalid_room_code' }, 400);
+      }
+
+      const id = env.PCHESS_ROOM.idFromName(code.toLowerCase());
+      const stub = env.PCHESS_ROOM.get(id);
+      return stub.fetch(request);
     }
 
-    const code = (url.searchParams.get('code') || '').trim();
-    if (!ROOM_CODE_RE.test(code)) {
-      return json({ error: 'invalid_room_code' }, 400);
-    }
-
-    const id = env.PCHESS_ROOM.idFromName(code.toLowerCase());
-    const stub = env.PCHESS_ROOM.get(id);
-    return stub.fetch(request);
+    const staticPath = /^\/(index\.html|css\/|js\/)/.test(url.pathname) ? url.pathname : '/';
+    return env.ASSETS.fetch(new Request(new URL(staticPath, request.url), request));
   },
 };
 
@@ -68,8 +70,16 @@ export class PChessRoom extends DurableObject<Env> {
     if (alive.length >= 2) {
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], [claimedRole]);
-      pair[1].send(JSON.stringify({ type: 'room-full' }));
-      pair[1].close();
+      // Chưa thể send()/close() ngay: handshake phía client chưa hoàn tất nên
+      // Cloudflare sẽ drop message và close frame. Hoãn lại để socket ổn định.
+      setTimeout(() => {
+        try {
+          pair[1].send(JSON.stringify({ type: 'room-full' }));
+          pair[1].close();
+        } catch {
+          /* ignore */
+        }
+      }, 100);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
