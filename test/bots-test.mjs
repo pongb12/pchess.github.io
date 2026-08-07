@@ -400,6 +400,50 @@ async function main() {
   kHost2.close();
   kGuest.close();
 
+  // 21) Vai trò theo khai báo (không phải first-free-slot): guest vào TRƯỚC vẫn
+  //     là guest, host vào sau vẫn là host; cả 2 đều nhận peer_joined để ván
+  //     bắt đầu được dù thứ tự vào phòng ngược.
+  console.log('\n-- Test vai trò theo khai báo (guest vào trước host) --');
+  const rRoom = 'role' + Date.now().toString(36);
+  const rGuest = new Bot('RGUEST', rRoom, 'guest');
+  await rGuest.connect();
+  msg = await rGuest.nextType('joined');
+  check('Vai trò: guest vào trước nhận role=guest', msg.role === 'guest', `got=${msg.role}`);
+  check('Vai trò: guest nhận color=b', msg.color === 'b', `got=${msg.color}`);
+
+  const rHost = new Bot('RHOST', rRoom, 'host');
+  await rHost.connect();
+  msg = await rHost.nextType('joined');
+  check('Vai trò: host vào sau nhận role=host', msg.role === 'host', `got=${msg.role}`);
+  check('Vai trò: host nhận color=w', msg.color === 'w', `got=${msg.color}`);
+  msg = await rHost.nextType('peer_joined');
+  check('Vai trò: host nhận peer_joined dù vào sau', msg.type === 'peer_joined');
+  msg = await rGuest.nextType('peer_joined');
+  check('Vai trò: guest nhận peer_joined khi host vào', msg.type === 'peer_joined');
+
+  // Host gửi init -> guest: mô phỏng host bắt đầu ván (bình thường do handlePeerJoined)
+  rHost.send({ type: 'init', color: 'b', settings: {}, fen: new Chess().fen() });
+  msg = await rGuest.nextType('init');
+  check('Vai trò: guest nhận init từ host', msg.type === 'init');
+
+  // Host thứ 3 khai 'host' (không reconnect) khi slot host đầy -> room-full
+  const rHost3 = new Bot('RHOST3', rRoom, 'host');
+  await rHost3.connect();
+  msg = await rHost3.nextAnyOf(['room-full', 'joined'], 8000);
+  check('Vai trò: host thứ 3 bị room-full (không chiếm chỗ)', msg.type === 'room-full', `got=${msg.type}`);
+  rHost3.close();
+
+  // Host thoát: slot host trống NHƯNG guest vẫn đang chiếm slot guest -> guest
+  // mới cũng phải room-full, không bị đẩy lên thành host.
+  rHost.close();
+  await wait(300);
+  const rGuest2 = new Bot('RGUEST2', rRoom, 'guest');
+  await rGuest2.connect();
+  msg = await rGuest2.nextAnyOf(['room-full', 'joined'], 8000);
+  check('Vai trò: guest thứ 2 bị room-full dù slot host trống', msg.type === 'room-full', `got=${msg.type}`);
+  rGuest2.close();
+  rGuest.close();
+
   console.log(`\n=== KẾT QUẢ: ${passed} PASS, ${failed} FAIL ===`);
   if (failed > 0) {
     console.log('FAIL:', failures.join(', '));

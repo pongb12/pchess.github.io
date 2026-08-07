@@ -1900,6 +1900,7 @@ const Analysis = {
     index: -1,
     evals: {},
     pendingPly: null,
+    requestPly: null,
     posChess: new Chess(),
 
     init() {
@@ -2004,6 +2005,8 @@ const Analysis = {
         }
         this.ready = false;
         this.failed = false;
+        this.pendingPly = null;
+        this.requestPly = null;
     },
 
     onEngineMessage(data) {
@@ -2023,7 +2026,7 @@ const Analysis = {
             const ply = this.pendingPly;
             if (ply == null) return;
             const score = this.parseScore(data);
-            const pv = this.parsePv(data);
+            const pv = this.parsePv(data, ply);
             if (score != null) {
                 this.evals[ply] = { score, pv, depth: this.parseDepth(data) };
             }
@@ -2036,6 +2039,8 @@ const Analysis = {
                 this.renderEval(ply);
             }
             this.pendingPly = null;
+            // Có vị trí mới được yêu cầu khi đang search: làm ngay bây giờ
+            if (this.requestPly != null) this.analyzeCurrent();
         }
     },
 
@@ -2054,11 +2059,15 @@ const Analysis = {
         return m ? parseInt(m[1], 10) : null;
     },
 
-    parsePv(line) {
+    parsePv(line, ply) {
         const m = line.match(/ pv (.+)$/);
         if (!m) return [];
         const ucis = m[1].trim().split(/\s+/);
-        const ch = this.posChess.clone();
+        // chess.js không có clone(): dựng lại vị trí ở ply từ đầu rồi chơi PV
+        const ch = new Chess();
+        try {
+            for (let i = 0; i < ply; i++) ch.move(this.pgnMoves[i]);
+        } catch (e) { /* ignore */ }
         const sans = [];
         for (const u of ucis) {
             if (u.length < 4) break;
@@ -2101,6 +2110,15 @@ const Analysis = {
 
     analyzeCurrent() {
         if (!this.ready || this.index < 0 || this.index > this.pgnMoves.length) return;
+        // Bản engine -single bị crash (RuntimeError: unreachable) nếu gửi
+        // position/go trong khi tìm kiếm trước chưa xong -> phải chờ bestmove.
+        // Ghi nhớ vị trí cần phân tích và xử lý khi bestmove đến.
+        if (this.pendingPly != null) {
+            this.requestPly = this.index;
+            return;
+        }
+        this.pendingPly = this.index;
+        this.requestPly = null;
         // Stockfish cần UCI (e2e4), chuyển từ SAN
         const ucis = [];
         const ch = new Chess();
@@ -2113,7 +2131,6 @@ const Analysis = {
             }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
-        this.pendingPly = this.index;
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth 16');
         document.getElementById('analysis-bestmove').textContent =

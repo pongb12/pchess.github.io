@@ -89,7 +89,11 @@ export class PChessRoom extends DurableObject<Env> {
       }
     }
 
-    let index = this.slots.findIndex((s) => !s);
+    // Slot theo VAI TRÒ đã khai báo (host=0, guest=1), không phải first-free-slot.
+    // Trước đây ai kết nối đầu tiên chiếm slot 0 = host: người nhận link của host
+    // nếu kết nối trước (hoặc khi slot host đang trống) sẽ bị gán làm HOST -> sai.
+    const roleIdx = claimedRole === 'host' ? 0 : 1;
+    let index = this.slots[roleIdx] ? -1 : roleIdx;
 
     // Chỉ khi đây là KẾT NỐI LẠI (client gửi reconnect=1): nếu socket cũ cùng
     // vai trò vẫn "sống" ở server (mất mạng không gửi close frame) thì kick nó
@@ -98,7 +102,6 @@ export class PChessRoom extends DurableObject<Env> {
     // WebSocketPair), nên phải gửi 'session-takeover' trước để client cũ biết
     // phiên đã bị thay thế.
     if (index < 0 && isReconnect) {
-      const roleIdx = claimedRole === 'host' ? 0 : 1;
       const existing = this.slots[roleIdx];
       if (existing) {
         try {
@@ -150,6 +153,9 @@ export class PChessRoom extends DurableObject<Env> {
     const target = this.slots[1 - index];
     if (target) {
       target.ws.send(JSON.stringify({ type: 'peer_joined' }));
+      // Báo cho cả người vừa vào: nhờ đó host vào SAU guest vẫn nhận peer_joined
+      // để gửi 'init' và bắt đầu ván (thứ tự vào phòng không quan trọng).
+      server.send(JSON.stringify({ type: 'peer_joined' }));
     }
 
     return new Response(null, { status: 101, webSocket: pair[0] });
