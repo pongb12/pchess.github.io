@@ -405,6 +405,7 @@ class PChessGame {
     bindEvents() {
         // Landing page
         document.getElementById('btn-create-room').addEventListener('click', () => this.createRoom());
+        document.getElementById('btn-goto-analysis').addEventListener('click', () => this.gotoAnalysis());
         document.getElementById('btn-join-room').addEventListener('click', () => this.joinFromInput());
         document.getElementById('input-room-link').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') this.joinFromInput();
@@ -746,6 +747,13 @@ class PChessGame {
             code += chars[Math.floor(Math.random() * chars.length)];
         }
         return code;
+    }
+
+    gotoAnalysis() {
+        this.showPage('landing-page', false);
+        this.showPage('analysis-page', true);
+        // Start analysis from initial position (empty moves)
+        Analysis.startFromGame([], { winner: null, reason: 'analysis', message: '*' });
     }
 
     async createRoom() {
