@@ -518,6 +518,19 @@ class PChessGame {
         if (dlBtn) {
             dlBtn.addEventListener('click', () => this.downloadFullEngine());
         }
+        // Lichess token — cho Opening Explorer
+        const lichessToken = document.getElementById('setting-lichess-token');
+        if (lichessToken) {
+            lichessToken.addEventListener('change', (e) => {
+                this.settings.lichessToken = e.target.value.trim();
+                this.saveSettings();
+                // Reset explorer cache + disabled flag để thử lại với token mới
+                if (window.Analysis) {
+                    Analysis._explorerCache = {};
+                    Analysis._explorerDisabled = false;
+                }
+            });
+        }
 
         // Promotion modal
         document.querySelectorAll('.promotion-piece').forEach(btn => {
@@ -580,6 +593,8 @@ class PChessGame {
         document.getElementById('setting-timer').value = this.settings.timer;
         const engineSelect = document.getElementById('setting-engine');
         if (engineSelect) engineSelect.value = this.settings.engine || 'server';
+        const lichessToken = document.getElementById('setting-lichess-token');
+        if (lichessToken) lichessToken.value = this.settings.lichessToken || '';
         document.querySelectorAll('.theme-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.theme === this.settings.theme);
         });
@@ -2237,12 +2252,18 @@ class PChessGame {
             animation: true,
             coords: false,
             timer: 0,
-            engine: 'auto'
+            engine: 'server',
+            lichessToken: ''
         };
 
         try {
             const saved = localStorage.getItem('pchess_settings');
-            if (saved) return { ...defaults, ...JSON.parse(saved) };
+            if (saved) {
+                const parsed = JSON.parse(saved);
+                // Migration: 'auto' engine không còn dùng → 'server'
+                if (parsed.engine === 'auto' || !parsed.engine) parsed.engine = 'server';
+                return { ...defaults, ...parsed };
+            }
         } catch (e) {
             console.warn('Failed to load settings');
         }
@@ -2932,21 +2953,15 @@ const Analysis = {
             return;
         }
         const mode = this.getEngineMode();
-        if (mode === 'server') {
+        // Server mode hoặc engine local chưa sẵn sàng → dùng server (fallback)
+        if (mode === 'server' || this._forceServer || !this.ready || !this.engine) {
+            if (mode !== 'server' && !this._forceServer) {
+                debugLog('warn', 'startFullAnalysis: local engine not ready, fallback to server');
+                this._forceServer = true;
+            }
             this._runServerAnalysis();
         } else {
-            // Local mode (lite/full)
-            if (this.failed) {
-                showToast('Stockfish không hoạt động, thử lại sau', 'warning');
-                return;
-            }
-            if (!this.ready) {
-                if (!this.engine) {
-                    this.ensureEngine();
-                }
-                this.pendingStartAfterReady = true;
-                return;
-            }
+            // Local mode (lite/full) với engine đã ready
             this.analyzeAll();
         }
     },
@@ -3045,9 +3060,16 @@ const Analysis = {
     // ===== analyzeCurrent — dispatcher theo mode =====
     analyzeCurrent() {
         const mode = this.getEngineMode();
-        if (mode === 'server') {
+        if (mode === 'server' || this._forceServer) {
             this._analyzeCurrentServer();
         } else {
+            // Local mode: phải có engine, không có thì fallback server
+            if (!this.engine || !this.ready) {
+                debugLog('warn', 'analyzeCurrent: engine not ready, fallback to server mode');
+                this._forceServer = true;
+                this._analyzeCurrentServer();
+                return;
+            }
             this._analyzeCurrentLocal();
         }
     },
@@ -3369,23 +3391,27 @@ const Analysis = {
     },
 
     // ===== Opening Explorer (client-side direct call to Lichess) =====
-    // Lichess explorer API (explorer.lichess.ovh) block datacenter IPs (server).
-    // Browser có IP residential nên gọi trực tiếp được.
-    // Cache per-FEN để tránh gọi lại.
+    // Lichess explorer API (explorer.lichess.ovh) hiện yêu cầu token (401).
+    // Ẩn panel nếu không có token, tránh spam lỗi 401 trong console.
     async renderOpeningExplorer(idx) {
         const container = document.getElementById('analysis-opening-explorer');
         if (!container) return;
         const fen = this.posChess.fen();
         const cacheKey = 'explorer_' + fen;
 
-        // Hiển thị "loading" lần đầu
         if (!this._explorerCache) this._explorerCache = {};
+
+        // Check 1 lần xem explorer có hoạt động không. Nếu 401 thì ẩn panel.
+        if (this._explorerDisabled) {
+            container.innerHTML = '<div class="explorer-empty">Opening Explorer cần Lichess API token (hiện không có). Vào <a href="https://lichess.org/account/api/token" target="_blank">lichess.org</a> để tạo token.</div>';
+            return;
+        }
+
         if (!this._explorerCache[cacheKey]) {
             this._explorerCache[cacheKey] = 'loading';
             container.innerHTML = '<div class="explorer-loading">Đang tải dữ liệu khai cuộc...</div>';
 
             try {
-                // Gọi trực tiếp explorer.lichess.ovh từ browser (CORS allowed, residential IP OK)
                 const [masters, community] = await Promise.all([
                     this._fetchExplorer(fen, 'masters'),
                     this._fetchExplorer(fen, 'lichess'),
@@ -3394,8 +3420,14 @@ const Analysis = {
                 this._explorerCache[cacheKey] = data;
                 this._renderExplorerData(container, data);
             } catch (err) {
-                this._explorerCache[cacheKey] = { error: err.message };
-                container.innerHTML = '<div class="explorer-error">Lỗi: ' + (err.message || err) + '</div>';
+                const msg = (err && err.message) || String(err);
+                if (msg.indexOf('401') !== -1) {
+                    this._explorerDisabled = true;
+                    container.innerHTML = '<div class="explorer-empty">Opening Explorer cần Lichess API token. <a href="https://lichess.org/account/api/token" target="_blank">Tạo token</a> rồi thêm vào Settings.</div>';
+                } else {
+                    this._explorerCache[cacheKey] = { error: msg };
+                    container.innerHTML = '<div class="explorer-error">Lỗi: ' + msg + '</div>';
+                }
             }
             return;
         }
@@ -3414,11 +3446,14 @@ const Analysis = {
         const url = type === 'masters'
             ? `https://explorer.lichess.ovh/masters?fen=${encodeURIComponent(fen)}`
             : `https://explorer.lichess.ovh/lichess?fen=${encodeURIComponent(fen)}&speeds[]=blitz&speeds[]=rapid&speeds[]=classical`;
-        const resp = await fetch(url, {
-            headers: {
-                'Accept': 'application/json',
-            },
-        });
+        const headers = { 'Accept': 'application/json' };
+        // Lichess explorer giờ yêu cầu API token (401 nếu không có)
+        const g = window.game;
+        const token = g && g.settings && g.settings.lichessToken;
+        if (token) {
+            headers['Authorization'] = 'Bearer ' + token;
+        }
+        const resp = await fetch(url, { headers });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
         return {
