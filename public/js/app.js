@@ -84,20 +84,6 @@ const EngineStore = {
     }
 };
 
-// Chuyển Blob -> base64 (chunked để tránh giữ quá nhiều bản sao trong bộ nhớ)
-// Lưu ý: CH phải chia hết cho 3, nếu không mỗi chunk có padding '=' riêng làm base64 nối lại bị sai.
-function blobToBase64(blob) {
-    return blob.arrayBuffer().then((buf) => {
-        const bytes = new Uint8Array(buf);
-        const chunks = [];
-        const CH = 0x3000;
-        for (let i = 0; i < bytes.length; i += CH) {
-            chunks.push(btoa(String.fromCharCode.apply(null, bytes.subarray(i, i + CH))));
-        }
-        return chunks.join('');
-    });
-}
-
 // ===== Sound Manager (Web Audio API) =====
 class SoundManager {
     constructor() {
@@ -2009,7 +1995,7 @@ class PChessGame {
             animation: true,
             coords: false,
             timer: 0,
-            engine: 'lite'
+            engine: 'auto'
         };
 
         try {
@@ -2218,27 +2204,48 @@ const Analysis = {
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
             this.engine.postMessage('uci');
             this.engine.postMessage('isready');
-            // Timeout nếu engine không sẵn sàng
+            // Bản Full cần thêm thời gian để compile WASM lớn trên máy chậm.
+            const timeout = (this._engineMode === 'full') ? 180000 : 30000;
             setTimeout(() => {
                 if (!this.ready && !this.failed) {
                     this.engineFailed('Stockfish không phản hồi (tải WASM quá lâu). Thử lại sau.');
                 }
-            }, 30000);
+            }, timeout);
         }).catch((err) => {
             if (gen !== this._gen) return;
             this.engineFailed(err && err.message ? err.message : 'Không tải được engine.');
         });
     },
 
-    // Trả về { url, revokeUrl }: worker chạy từ blob URL của file js. Worker dạng blob
-    // KHÔNG fetch được blob: URL khác (đã kiểm chứng) nên với bản full ta prepend code
-    // monkeypatch self.fetch: loader sẽ lấy được bytes wasm qua Response() tự dựng —
-    // đã kiểm chứng end-to-end bằng Stockfish 18 thật (uciok -> bestmove).
+    // Kiểm tra xem bản Full đã cài trong IndexedDB chưa
+    async _hasFullEngine() {
+        try {
+            const js = await EngineStore.load('engine-full');
+            const wasm = await EngineStore.load('engine-full-wasm');
+            return js && wasm && wasm.size >= 50 * 1048576;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    // Trả về { url, revokeUrl }. Với bản Full, giữ WASM ở Blob URL riêng và
+    // truyền qua hash đúng theo loader của stockfish-18-single.js, tránh nhét
+    // ~108MB WASM thành base64 vào worker script.
     async engineUrl() {
-        const mode = (window.game && window.game.settings && window.game.settings.engine) || 'lite';
+        // Tự động chọn 'full' nếu đã cài, ngược lại dùng 'lite'
+        const settingsMode = (window.game && window.game.settings && window.game.settings.engine) || 'auto';
+        let mode = settingsMode;
+        if (mode === 'lite' || mode === 'auto') {
+            const hasFull = await this._hasFullEngine();
+            if (hasFull) mode = 'full';
+        }
+        this._engineMode = mode;
+
         if (mode !== 'full') {
+            this.setEngineStatus('Đang tải Stockfish (lite)...');
             return { url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null };
         }
+        this.setEngineStatus('Đang tải Stockfish (full)...');
         const js = await EngineStore.load('engine-full');
         const wasm = await EngineStore.load('engine-full-wasm');
         if (!js) throw new Error('Chưa cài bản Full. Vào Cài đặt > Stockfish và ấn "Tự tải bản Full" (hoặc chọn thủ công 2 file).');
@@ -2246,15 +2253,16 @@ const Analysis = {
         if (wasm.size < 50 * 1048576) {
             throw new Error('File .wasm có vẻ không đúng (quá nhỏ). Hãy cài lại bản Full.');
         }
-        const b64 = await blobToBase64(wasm);
         const src = await js.text();
         if (src.length < 5000 || src.indexOf('stockfish') === -1) {
             throw new Error('File stockfish-18-single.js không đúng phiên bản. Cài lại bản Full.');
         }
-        const header = 'var __PCHESS_B64="' + b64 + '";var __PCHESS_BYTES=(function(){var s=atob(__PCHESS_B64),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u})();var __PCHESS_OLD_FETCH=self.fetch;self.fetch=function(i,n){if(typeof i==="string"||(i&&i.url)){return Promise.resolve(new Response(__PCHESS_BYTES,{status:200,headers:{"Content-Type":"application/wasm","Content-Length":__PCHESS_BYTES.length}}));}return __PCHESS_OLD_FETCH(i,n)};';
-        const patched = header + src;
-        const revokeUrl = URL.createObjectURL(new Blob([patched], { type: 'text/javascript' }));
-        return { url: revokeUrl, revokeUrl };
+        const jsUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const wasmUrl = URL.createObjectURL(wasm);
+        return {
+            url: jsUrl + '#' + encodeURIComponent(wasmUrl) + ',worker',
+            revokeUrl: [jsUrl, wasmUrl]
+        };
     },
 
     engineFailed(msg) {
@@ -2264,6 +2272,18 @@ const Analysis = {
             try { this.engine.terminate(); } catch (e) { /* ignore */ }
             this.engine = null;
         }
+        this.revokeEngineUrls();
+    },
+
+    revokeEngineUrls() {
+        if (!this.engineUrlValue) return;
+        const urls = Array.isArray(this.engineUrlValue) ? this.engineUrlValue : [this.engineUrlValue];
+        for (const url of urls) {
+            if (url && url.indexOf('blob:') === 0) {
+                try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+            }
+        }
+        this.engineUrlValue = null;
     },
 
     stopEngine() {
@@ -2274,10 +2294,7 @@ const Analysis = {
             } catch (e) { /* ignore */ }
             this.engine = null;
         }
-        if (this.engineUrlValue && this.engineUrlValue.indexOf('blob:') === 0) {
-            try { URL.revokeObjectURL(this.engineUrlValue); } catch (e) { /* ignore */ }
-        }
-        this.engineUrlValue = null;
+        this.revokeEngineUrls();
         this.ready = false;
         this.failed = false;
         this.pendingPly = null;
