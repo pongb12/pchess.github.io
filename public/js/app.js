@@ -2591,6 +2591,10 @@ const Analysis = {
     _svgCache: null,
     _engineMode: 'lite',
     MULTI_PV_COUNT: 3,
+    _watchdogTimer: null,
+    _heartbeatTimer: null,
+    _forceLite: false,
+    _fallbackTried: false,
 
     init() {
         document.getElementById('btn-analysis-back').addEventListener('click', () => this.exit());
@@ -2697,36 +2701,89 @@ const Analysis = {
         if (this.engine || this.failed) return;
         this.setEngineStatus('Đang tải Stockfish...');
         const gen = ++this._gen;
+        const startMode = this._engineMode; // ghi lại mode dự định
         this.engineUrl().then((res) => {
             // Đã exit/stop giữa lúc đọc IndexedDB thì bỏ qua
             if (gen !== this._gen || this.engine || this.failed) return;
+            this.setEngineStatus(this._engineMode === 'full'
+                ? 'Đang khởi tạo Worker bản Full (~108MB WASM — có thể mất 30-120s để compile trên máy chậm)...'
+                : 'Đang khởi tạo Worker bản Lite...');
             try {
                 this.engine = new Worker(res.url);
                 this.engineUrlValue = res.revokeUrl;
             } catch (err) {
-                this.engineFailed('Không tạo được worker: ' + err.message);
+                // CSP hoặc browser không hỗ trợ Blob URL worker
+                this._tryFallbackToLite('Không tạo được worker: ' + err.message, gen);
                 return;
             }
             this.engine.onerror = (e) => {
-                this.engineFailed('Stockfish lỗi: ' + (e.message || 'worker error'));
+                // Worker throw error hoặc fail load. Có thể là WASM compile lỗi,
+                // fetch wasmUrl fail, hoặc CSP chặn.
+                const msg = e.message || (e.filename ? ('tại ' + e.filename.split('/').pop() + ':' + e.lineno) : 'worker error');
+                this._tryFallbackToLite('Stockfish lỗi: ' + msg, gen);
+                return;
             };
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
+            // CHỈ gửi 'uci' trước. setoption MultiPV và isready sẽ gửi SAU uciok
+            // (đúng UCI protocol — một số engine bỏ qua setoption nếu gửi quá sớm).
             this.engine.postMessage('uci');
-            // Multi-PV: yêu cầu engine trả về N đường tốt nhất cho mỗi vị trí.
-            // Stockfish 18 hỗ trợ 'setoption name MultiPV value N'.
-            this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
-            this.engine.postMessage('isready');
-            // Bản Full cần thêm thời gian để compile WASM lớn trên máy chậm.
-            const timeout = (this._engineMode === 'full') ? 180000 : 30000;
-            setTimeout(() => {
+
+            // Heartbeat: cập nhật status sau 30s nếu vẫn đang đợi, để user biết
+            // engine vẫn đang compile chứ không bị treo.
+            if (this._heartbeatTimer) clearTimeout(this._heartbeatTimer);
+            this._heartbeatTimer = setTimeout(() => {
+                if (gen !== this._gen) return;
+                if (!this.ready && !this.failed && this._engineMode === 'full') {
+                    this.setEngineStatus('Vẫn đang compile WASM (108MB). Vui lòng đợi thêm — có thể mất đến 5 phút trên máy yếu...');
+                }
+            }, 30000);
+
+            // Watchdog: bản Full có thể cần đến 5 phút để compile WASM trên máy chậm.
+            // Lite chỉ cần 30s.
+            const timeout = (this._engineMode === 'full') ? 300000 : 30000;
+            if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
+            this._watchdogTimer = setTimeout(() => {
+                if (gen !== this._gen) return;
                 if (!this.ready && !this.failed) {
-                    this.engineFailed('Stockfish không phản hồi (tải WASM quá lâu). Thử lại sau.');
+                    this._tryFallbackToLite('Stockfish không phản hồi sau ' + (timeout / 1000) + 's', gen);
                 }
             }, timeout);
         }).catch((err) => {
             if (gen !== this._gen) return;
-            this.engineFailed(err && err.message ? err.message : 'Không tải được engine.');
+            this._tryFallbackToLite(err && err.message ? err.message : 'Không tải được engine', gen);
         });
+    },
+
+    // Fallback: nếu bản Full fail (timeout/error), thử lại với bản Lite.
+    // Chỉ fallback một lần — nếu Lite cũng fail thì báo lỗi thật.
+    _tryFallbackToLite(reason, gen) {
+        // Cleanup engine hiện tại
+        if (this.engine) {
+            try { this.engine.terminate(); } catch (e) { /* ignore */ }
+            this.engine = null;
+        }
+        this.revokeEngineUrls();
+        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
+        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
+
+        // Nếu đang dùng full (hoặc auto chọn full), thử lite
+        if (this._engineMode === 'full' && !this._fallbackTried) {
+            this._fallbackTried = true;
+            debugLog('warn', 'Stockfish bản Full thất bại:', reason, '— thử bản Lite');
+            this.setEngineStatus('Bản Full thất bại (' + reason + '). Đang thử bản Lite...');
+            // Force dùng lite
+            this._engineMode = 'lite';
+            this._forceLite = true;
+            // Đợi 500ms rồi retry
+            setTimeout(() => {
+                if (gen !== this._gen) return;
+                this.ensureEngine();
+            }, 500);
+            return;
+        }
+
+        // Lite cũng fail hoặc đã fallback rồi
+        this.engineFailed(reason + (this._fallbackTried ? ' (đã thử bản Lite cũng fail)' : ''));
     },
 
     // Kiểm tra xem bản Full đã cài trong IndexedDB chưa
@@ -2744,33 +2801,39 @@ const Analysis = {
     // truyền qua hash đúng theo loader của stockfish-18-single.js, tránh nhét
     // ~108MB WASM thành base64 vào worker script.
     async engineUrl() {
-        // Tự động chọn 'full' nếu đã cài, ngược lại dùng 'lite'
+        // Nếu đã force dùng lite (do full fail trước đó), luôn dùng lite
         const settingsMode = (window.game && window.game.settings && window.game.settings.engine) || 'auto';
         let mode = settingsMode;
-        if (mode === 'lite' || mode === 'auto') {
+        if (this._forceLite) {
+            mode = 'lite';
+        } else if (mode === 'lite' || mode === 'auto') {
             const hasFull = await this._hasFullEngine();
             if (hasFull) mode = 'full';
         }
         this._engineMode = mode;
 
         if (mode !== 'full') {
-            this.setEngineStatus('Đang tải Stockfish (lite)...');
+            this.setEngineStatus('Đang tải Stockfish (lite ~7MB)...');
             return { url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null };
         }
-        this.setEngineStatus('Đang tải Stockfish (full)...');
+        this.setEngineStatus('Đang đọc file bản Full từ IndexedDB (~108MB)...');
         const js = await EngineStore.load('engine-full');
         const wasm = await EngineStore.load('engine-full-wasm');
         if (!js) throw new Error('Chưa cài bản Full. Vào Cài đặt > Stockfish và ấn "Tự tải bản Full" (hoặc chọn thủ công 2 file).');
         if (!wasm) throw new Error('Thiếu file stockfish-18-single.wasm của bản Full. Vào Cài đặt > Stockfish để cài lại.');
         if (wasm.size < 50 * 1048576) {
-            throw new Error('File .wasm có vẻ không đúng (quá nhỏ). Hãy cài lại bản Full.');
+            throw new Error('File .wasm có vẻ không đúng (quá nhỏ, ' + (wasm.size / 1048576).toFixed(1) + 'MB). Hãy cài lại bản Full.');
         }
+        this.setEngineStatus('Đang tạo Blob URL cho bản Full...');
         const src = await js.text();
         if (src.length < 5000 || src.indexOf('stockfish') === -1) {
-            throw new Error('File stockfish-18-single.js không đúng phiên bản. Cài lại bản Full.');
+            throw new Error('File stockfish-18-single.js không đúng phiên bản (size ' + src.length + ' bytes). Cài lại bản Full.');
         }
         const jsUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
         const wasmUrl = URL.createObjectURL(wasm);
+        // Stockfish-18-single.js đọc wasm URL từ self.location.hash theo format:
+        //   #<encodedWasmUrl>,worker
+        // Sau đó fetch(wasmUrl) để load WASM. Cơ chế này hoạt động cả với Blob URL.
         return {
             url: jsUrl + '#' + encodeURIComponent(wasmUrl) + ',worker',
             revokeUrl: [jsUrl, wasmUrl]
@@ -2779,6 +2842,9 @@ const Analysis = {
 
     engineFailed(msg) {
         this.failed = true;
+        // Clear timers nếu có
+        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
+        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.setEngineStatus('⚠️ ' + msg, true);
         if (this.engine) {
             try { this.engine.terminate(); } catch (e) { /* ignore */ }
@@ -2809,6 +2875,11 @@ const Analysis = {
         this.revokeEngineUrls();
         this.ready = false;
         this.failed = false;
+        // Reset fallback flags để user có thể retry bản Full sau khi exit
+        this._forceLite = false;
+        this._fallbackTried = false;
+        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
+        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.pendingPly = null;
         this.requestPly = null;
         this.batchQueue = null;
@@ -2817,14 +2888,25 @@ const Analysis = {
 
     onEngineMessage(data) {
         if (typeof data !== 'string') return;
+        // Khi nhận bất kỳ message nào từ worker, clear heartbeat (engine đã start)
+        if (this._heartbeatTimer) {
+            clearTimeout(this._heartbeatTimer);
+            this._heartbeatTimer = null;
+        }
         if (data === 'uciok') {
+            // Sau uciok mới gửi setoption và isready (đúng UCI protocol).
+            // Trước đây gửi setoption trước uciok — một số engine bỏ qua.
+            this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
             this.engine.postMessage('isready');
+            this.setEngineStatus('Đang chờ Stockfish ready (compile WASM)...');
             return;
         }
         if (data === 'readyok') {
             this.ready = true;
             this.failed = false;
-            this.setEngineStatus('Stockfish 18 sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ')');
+            // Clear watchdog vì engine đã respond
+            if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
+            this.setEngineStatus('Stockfish 18 sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', mode ' + (this._engineMode || '?') + ')');
             this.analyzeCurrent();
             if (this.pendingStartAfterReady) {
                 this.pendingStartAfterReady = false;
