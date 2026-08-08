@@ -1,0 +1,20 @@
+npm error code EACCES
+npm error errno EACCES
+npm error FetchError: request to https://registry.npmjs.org/wrangler failed, reason: 
+npm error     at ClientRequest.<anonymous> (C:\Users\trans\AppData\Roaming\npm\node_modules\npm\node_modules\minipass-fetch\lib\index.js:130:14)
+npm error     at ClientRequest.emit (node:events:508:28)
+npm error     at emitErrorEvent (node:_http_client:108:11)
+npm error     at _destroy (node:_http_client:963:9)
+npm error     at onSocketNT (node:_http_client:983:5)
+npm error     at process.processTicksAndRejections (node:internal/process/task_queues:91:21) {
+npm error   code: 'EACCES',
+npm error   errno: 'EACCES',
+npm error   type: 'system'
+npm error }
+npm error
+npm error The operation was rejected by your operating system.
+npm error It's possible that the file was already in use (by a text editor or antivirus), or that you lack permissions to access it.
+npm error
+npm error If you believe this might be a permissions issue, please double-check the permissions of the file and its containing directories, or try running the command again as root/Administrator.
+npm error Log files were not written due to an error writing to the directory: C:\Users\trans\AppData\Local\npm-cache\_logs
+npm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal

@@ -306,6 +306,12 @@ async function main() {
   // 16) Rematch: cả 2 đồng ý -> server xóa ván
   console.log('\n-- Test rematch --');
   host.send({ type: 'rematch_accept' });
+  await wait(150);
+  host.send({ type: 'sync_request' });
+  msg = await host.nextType('sync');
+  check('HOST: sync after one rematch_accept keeps old game', msg.fen === serverChess.fen(), `got=${msg.fen} want=${serverChess.fen()}`);
+  check('HOST: history not cleared after one rematch_accept', Array.isArray(msg.history) && msg.history.length === 14, `len=${msg.history.length}`);
+
   guest3.send({ type: 'rematch_accept' });
   await wait(150);
   host.send({ type: 'sync_request' });

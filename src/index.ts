@@ -65,6 +65,10 @@ interface GameState {
   history: string[];
 }
 
+interface RematchState {
+  accepted: Role[];
+}
+
 export class PChessRoom extends DurableObject<Env> {
   // Trạng thái chống spam theo socket. QUAN TRỌNG: bộ nhớ trong bị xoá sạch khi
   // Durable Object "ngủ đông" (hibernation) — nên mọi trạng thái phòng PHẢI lấy
@@ -208,8 +212,18 @@ export class PChessRoom extends DurableObject<Env> {
       await this.sendAuthoritativeSync(ws);
       return;
     }
+    if (type === 'rematch_request') {
+      await this.noteRematchAccepted(ws);
+    }
     if (type === 'rematch_accept') {
-      await this.ctx.storage.delete('game');
+      const ready = await this.noteRematchAccepted(ws);
+      if (ready) {
+        await this.ctx.storage.delete('game');
+        await this.ctx.storage.delete('rematch');
+      }
+    }
+    if (type === 'rematch_decline') {
+      await this.ctx.storage.delete('rematch');
     }
 
     // Relay tin nhắn giữa 2 người (resign, draw_*, rematch_*, game_over, chat,
@@ -333,6 +347,7 @@ export class PChessRoom extends DurableObject<Env> {
     }
 
     history.push(result.san);
+    await this.ctx.storage.delete('rematch');
     await this.ctx.storage.put('game', { fen: chess.fen(), history } satisfies GameState);
 
     this.broadcast({ type: 'move', move: { from: move.from, to: move.to, promotion }, san: result.san, fen: chess.fen() });
@@ -341,5 +356,16 @@ export class PChessRoom extends DurableObject<Env> {
   private async sendAuthoritativeSync(ws: WebSocket) {
     const { chess, history } = await this.loadGame();
     ws.send(JSON.stringify({ type: 'sync', fen: chess.fen(), history }));
+  }
+
+  private async noteRematchAccepted(ws: WebSocket): Promise<boolean> {
+    const role = this.roleOf(ws);
+    if (!role) return false;
+
+    const saved = await this.ctx.storage.get<RematchState>('rematch');
+    const accepted = new Set<Role>(saved?.accepted || []);
+    accepted.add(role);
+    await this.ctx.storage.put('rematch', { accepted: [...accepted] } satisfies RematchState);
+    return ROLES.every((r) => accepted.has(r));
   }
 }
