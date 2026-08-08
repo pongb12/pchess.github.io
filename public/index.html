@@ -548,31 +548,40 @@
                     <div class="analysis-bestmove" id="analysis-bestmove">Chờ Stockfish phân tích...</div>
                 </div>
 
-                <aside class="analysis-panel">
-                    <div class="panel-section">
+                <aside class="analysis-panel" id="analysis-panel">
+                    <!-- Mobile tab bar (ẩn trên desktop qua CSS) -->
+                    <div class="analysis-panel-tabs" id="analysis-panel-tabs">
+                        <button class="analysis-panel-tab active" data-section="multipv">3 PV</button>
+                        <button class="analysis-panel-tab" data-section="phase">Giai đoạn</button>
+                        <button class="analysis-panel-tab" data-section="classification">Phân loại</button>
+                        <button class="analysis-panel-tab" data-section="chart">Biểu đồ</button>
+                        <button class="analysis-panel-tab" data-section="movelist">Nước đi</button>
+                        <button class="analysis-panel-tab" data-section="pgn">PGN</button>
+                    </div>
+                    <div class="panel-section active" data-section="multipv">
                         <h3>3 đường tốt nhất (Multi-PV)</h3>
                         <div id="analysis-multipv" class="analysis-multipv">—</div>
                     </div>
-                    <div class="panel-section">
+                    <div class="panel-section" data-section="phase">
                         <h3>Đánh giá theo giai đoạn</h3>
                         <div id="analysis-phase-stats" class="analysis-phase-stats">—</div>
                     </div>
-                    <div class="panel-section">
+                    <div class="panel-section" data-section="classification">
                         <h3>Thống kê phân loại</h3>
                         <div id="analysis-classification-stats" class="analysis-classification-stats"></div>
                     </div>
-                    <div class="panel-section">
+                    <div class="panel-section" data-section="chart">
                         <h3>Biểu đồ áp đảo</h3>
                         <div class="analysis-chart-wrap">
                             <svg id="analysis-chart" class="analysis-chart" viewBox="0 0 600 220" preserveAspectRatio="none"></svg>
                             <div id="analysis-chart-empty" class="analysis-chart-empty">Chưa có dữ liệu. Ấn "Bắt đầu phân tích"</div>
                         </div>
                     </div>
-                    <div class="panel-section">
+                    <div class="panel-section" data-section="movelist">
                         <h3>Nước đi &amp; Đánh giá</h3>
                         <div id="analysis-movelist" class="analysis-movelist"></div>
                     </div>
-                    <div class="panel-section">
+                    <div class="panel-section" data-section="pgn">
                         <h3>PGN</h3>
                         <textarea id="analysis-pgn-text" class="analysis-pgn-text" readonly rows="6"></textarea>
                     </div>

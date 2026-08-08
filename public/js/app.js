@@ -2662,6 +2662,23 @@ const Analysis = {
             const i = Math.round(frac * geo.N);
             this.goTo(Math.max(0, Math.min(geo.N, i)));
         });
+        // Mobile panel tabs — switch giữa các section
+        document.querySelectorAll('.analysis-panel-tab').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const section = e.target.dataset.section;
+                this.switchPanelTab(section);
+            });
+        });
+    },
+
+    // Switch panel tab (mobile accordion)
+    switchPanelTab(section) {
+        document.querySelectorAll('.analysis-panel-tab').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.section === section);
+        });
+        document.querySelectorAll('#analysis-panel .panel-section').forEach(el => {
+            el.classList.toggle('active', el.dataset.section === section);
+        });
     },
 
     startFromGame(moves, result) {
