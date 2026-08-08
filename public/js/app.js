@@ -873,20 +873,29 @@ class PChessGame {
     }
 
     joinFromInput() {
-        const input = document.getElementById('input-room-link').value.trim();
-        if (!input) {
-            showToast('Vui lòng nhập link phòng', 'warning');
+        const raw = document.getElementById('input-room-link').value.trim();
+        if (!raw) {
+            showToast('Vui lòng nhập link hoặc mã phòng', 'warning');
             return;
         }
 
         // Extract room ID from link or direct input
-        let roomId = input;
+        let roomId = raw;
         try {
-            const url = new URL(input);
+            const url = new URL(raw);
             const hash = url.hash.replace('#', '');
             if (hash) roomId = hash;
         } catch (e) {
             // Not a URL, treat as room ID
+        }
+
+        // Normalize: uppercase, trim, remove spaces
+        roomId = roomId.toUpperCase().replace(/\s+/g, '');
+
+        // Validate: chỉ cho phép chữ cái + số, độ dài 4-20
+        if (!/^[A-Z0-9]{4,20}$/.test(roomId)) {
+            showToast('Mã phòng không hợp lệ (4-20 ký tự A-Z, 0-9)', 'warning');
+            return;
         }
 
         this.joinRoom(roomId);

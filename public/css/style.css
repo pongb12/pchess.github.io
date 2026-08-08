@@ -132,16 +132,25 @@ html, body {
     width: 100%;
 }
 
-/* ===== Pages ===== */
+/* ===== Page ===== */
 .page {
     display: none;
     height: 100%;
     width: 100%;
     animation: fadeIn 0.3s ease;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Analysis page: không scroll page, scroll panel */
+#analysis-page {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 .page.active {
     display: flex;
+    flex-direction: column;
 }
 
 @keyframes fadeIn {
@@ -227,6 +236,13 @@ html, body {
     color: var(--text-primary);
     font-size: 0.95rem;
     transition: border-color var(--transition-fast);
+    /* Mobile: hiển thị mã phòng in hoa, mono font để dễ đọc */
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+    letter-spacing: 1px;
+    /* Đảm bảo input không zoom iOS khi font >= 16px */
+    -webkit-appearance: none;
+    appearance: none;
 }
 
 .join-section input:focus {
@@ -2008,9 +2024,10 @@ html, body {
     /* ===== Layout: board full width, panel bên dưới dạng accordion ===== */
     .analysis-layout {
         flex-direction: column;
-        padding: 8px;
-        gap: 8px;
+        padding: 6px;
+        gap: 6px;
         align-items: stretch;
+        height: auto;
     }
     .analysis-board-wrap {
         width: 100%;
@@ -2018,16 +2035,18 @@ html, body {
         flex: 0 0 auto;
     }
     .analysis-board-container {
-        gap: 4px;
+        gap: 3px;
     }
     #analysis-board {
-        /* Board chiếm tối đa không gian, aspect-ratio giữ 1:1 */
-        width: 100%;
+        /* Board chiếm tối đa viewport width, aspect-ratio 1:1 */
+        width: calc(100vw - 18px);
+        max-width: 100%;
         aspect-ratio: 1;
-        flex: 1 1 auto;
+        flex: 0 1 auto;
     }
     .analysis-eval-bar {
-        width: 22px;
+        width: 18px;
+        flex: 0 0 auto;
     }
 
     /* ===== Controls: compact, full-width row ===== */
@@ -2037,10 +2056,24 @@ html, body {
         flex-wrap: wrap;
         justify-content: center;
     }
+    /* Nav row + action row tách biệt trên mobile */
+    .analysis-nav-row {
+        justify-content: space-between;
+        gap: 3px;
+    }
+    .analysis-action-row {
+        justify-content: center;
+        gap: 6px;
+    }
     .analysis-controls .btn-icon {
         width: 40px;
         height: 40px;
         font-size: 1rem;
+    }
+    .analysis-action-row .btn-secondary {
+        min-height: 40px;
+        padding: 6px 12px;
+        font-size: 0.8rem;
     }
     .analysis-pos-label {
         min-width: 50px;

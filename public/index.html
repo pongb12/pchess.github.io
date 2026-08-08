@@ -37,7 +37,7 @@
                     </div>
 
                     <div class="join-section">
-                        <input type="text" id="input-room-link" placeholder="Dán link phòng vào đây...">
+                        <input type="text" id="input-room-link" placeholder="Dán link HOẶC nhập mã phòng (vd: ABC123)" maxlength="40" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false">
                         <button id="btn-join-room" class="btn btn-secondary">
                             <span>Vào phòng</span>
                         </button>
@@ -533,13 +533,18 @@
                         <span id="analysis-scrub-label" class="analysis-scrub-label">0 / 0</span>
                     </div>
 
-                    <div class="analysis-controls">
+                    <!-- Navigation row: prev/next/scrub controls -->
+                    <div class="analysis-controls analysis-nav-row">
                         <button id="btn-an-first" class="btn btn-icon" title="Về đầu (Home)">⏮</button>
                         <button id="btn-an-prev" class="btn btn-icon" title="Nước trước (←)">◀</button>
                         <button id="btn-an-play" class="btn btn-icon" title="Phát / dừng (Space)">▶</button>
                         <button id="btn-an-next" class="btn btn-icon" title="Nước sau (→)">▶</button>
                         <button id="btn-an-last" class="btn btn-icon" title="Đến cuối (End)">⏭</button>
                         <span id="analysis-position-label" class="analysis-pos-label">0/0</span>
+                    </div>
+
+                    <!-- Action row: flip/undo/why -->
+                    <div class="analysis-controls analysis-action-row">
                         <button id="btn-an-flip" class="btn btn-icon" title="Lật bàn cờ">⇅</button>
                         <button id="btn-an-undo" class="btn btn-icon" title="Lùi 1 nước (chế độ phân tích cục bộ)">↶</button>
                         <button id="btn-an-why" class="btn btn-secondary" title="Giải thích nước này tại sao tốt/tệ">? Tại sao</button>
