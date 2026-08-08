@@ -406,39 +406,8 @@
 
                     <div class="setting-group">
                         <h3>🧠 Stockfish</h3>
-                        <div class="setting-row">
-                            <label>Engine</label>
-                            <select id="setting-engine">
-                                <option value="auto">Tự động (ưu tiên Full nếu đã cài)</option>
-                                <option value="lite">Lite (nhẹ ~7MB)</option>
-                                <option value="full">Full (mạnh ~108MB)</option>
-                            </select>
-                        </div>
-                        <div class="setting-row">
-                            <label>File Full</label>
-                            <div class="engine-import-row">
-                                <span id="engine-full-status" class="engine-full-status">Chưa cài</span>
-                                <button id="btn-clear-engine" class="btn btn-secondary" type="button">Xóa</button>
-                            </div>
-                        </div>
                         <div class="setting-row setting-hint-row">
-                            <span class="setting-hint">Bản Full mạnh hơn rất nhiều nhưng nặng (~108MB). Ấn nút dưới để tự tải về và lưu trong trình duyệt này (IndexedDB) — không tải lên server.</span>
-                        </div>
-                        <div class="setting-row">
-                            <button id="btn-download-engine" class="btn btn-primary" type="button">⬇ Tự tải bản Full (~108MB)</button>
-                        </div>
-                        <div class="setting-row setting-hint-row" id="engine-download-progress-wrap" style="display:none">
-                            <div class="engine-download-progress">
-                                <div id="engine-download-bar" class="engine-download-bar"></div>
-                            </div>
-                            <span id="engine-download-text" class="engine-full-status"></span>
-                        </div>
-                        <div class="setting-row setting-hint-row">
-                            <span class="setting-hint">Hoặc chọn thủ công 2 file <code>stockfish-18-single.js</code> và <code>stockfish-18-single.wasm</code>:</span>
-                        </div>
-                        <div class="setting-row">
-                            <button id="btn-import-engine" class="btn btn-secondary" type="button">Chọn file (js + wasm)</button>
-                            <input type="file" id="engine-file-input" accept=".js,.wasm,application/javascript,text/javascript,application/wasm" multiple hidden>
+                            <span class="setting-hint">Phân tích chạy trên server qua Lichess Cloud Eval API — không cần tải Stockfish về trình duyệt. Độ sâu ~30, Multi-PV 3, có tên khai cuộc.</span>
                         </div>
                     </div>
                 </div>

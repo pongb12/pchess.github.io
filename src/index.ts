@@ -141,7 +141,7 @@ export default {
       const isReconnect = url.searchParams.get('reconnect') === '1';
       const allowed = isReconnect
         ? ipAllowed(ipReconnectBuckets, ip, IP_RECONNECT_MAX, IP_RECONNECT_WINDOW_MS)
-        : ipAllowed(ipRoomCreateBuckets, ip, IP_ROOM_CREATE_MAX, IP_ROOM_CREATE_WINDOW_MS);
+        : ipAllowed(ipRoomCreateBuckets, ip, IP_RECONNECT_MAX, IP_RECONNECT_WINDOW_MS);
       if (!allowed) {
         return json({ error: 'rate_limited' }, 429);
       }
@@ -155,10 +155,186 @@ export default {
       return stub.fetch(new Request(request, { headers }));
     }
 
+    // ===== Server-side analysis endpoint =====
+    // Client gửi PGN (hoặc list of moves SAN), server gọi Lichess API cho mỗi
+    // position, trả về JSON có eval + multi-PV + opening name sẵn. Tránh tải
+    // Stockfish WASM 108MB trên browser.
+    if (url.pathname === '/api/analyze') {
+      return handleAnalyze(request, env);
+    }
+
+    // Static assets fallback — defensive: nếu env.ASSETS undefined (do deploy issue),
+    // trả về 500 với message rõ ràng thay vì crash.
+    if (!env.ASSETS) {
+      return json({ error: 'assets_binding_missing', message: 'Static assets binding not configured. Check wrangler.toml [assets] section.' }, 500);
+    }
     const staticPath = /^\/(index\.html|css\/|js\/|stockfish\/|assets\/)/.test(url.pathname) ? url.pathname : '/';
     return env.ASSETS.fetch(new Request(new URL(staticPath, request.url), request));
   },
 };
+
+// ===== Server-side analysis: gọi Lichess Cloud Eval API =====
+// Lichess API miễn phí, có multi-PV + opening name + depth ~30.
+// Rate limit: ~60 req/min (unauth). Cho post-game analysis (~20-60 positions)
+// thì cần batch + cache.
+//
+// Cache: dùng Cloudflare KV (nếu có binding ANALYSIS_CACHE) hoặc in-memory Map
+// (per-isolate, không persistent). Hiện dùng in-memory để đơn giản.
+const analysisCache = new Map<string, unknown>();
+
+interface LichessEval {
+  fen: string;
+  knodes: number;
+  depth: number;
+  pvs: Array<{ moves: string; cp: number | null; mate: number | null }>;
+  opening?: { eco: string; name: string };
+}
+
+async function lichessEval(fen: string, multiPv = 3): Promise<LichessEval | null> {
+  const cacheKey = fen + '|' + multiPv;
+  const cached = analysisCache.get(cacheKey);
+  if (cached) return cached as LichessEval;
+
+  // Endpoint đúng: /api/cloud-eval (không phải /api/eval — cái đó 404)
+  const url = `https://lichess.org/api/cloud-eval?fen=${encodeURIComponent(fen)}&multiPv=${multiPv}`;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'PChess/1.0 (https://github.com/pongb12/pchess.github.io)',
+        'Accept': 'application/json',
+      },
+    });
+    // Lichess cloud-eval có thể trả về 404 cho FEN không hợp lệ hoặc position hiếm
+    if (!resp.ok) {
+      console.log(`[lichessEval] fen=${fen.substring(0,30)} status=${resp.status}`);
+      return null;
+    }
+    const data = (await resp.json()) as LichessEval;
+    analysisCache.set(cacheKey, data);
+    return data;
+  } catch (e) {
+    console.log(`[lichessEval] exception: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+async function handleAnalyze(request: Request, _env: Env): Promise<Response> {
+  if (request.method !== 'POST') {
+    return json({ error: 'method_not_allowed' }, 405);
+  }
+
+  let body: { pgn?: string; moves?: string[] };
+  try {
+    body = await request.json() as { pgn?: string; moves?: string[] };
+  } catch {
+    return json({ error: 'invalid_json' }, 400);
+  }
+
+  // Parse PGN hoặc nhận list of SAN moves
+  const chess = new Chess();
+  if (body.pgn) {
+    try {
+      chess.load_pgn(body.pgn);
+    } catch (e) {
+      return json({ error: 'invalid_pgn', message: (e as Error).message }, 400);
+    }
+  } else if (Array.isArray(body.moves) && body.moves.length) {
+    try {
+      for (const san of body.moves) {
+        chess.move(san);
+      }
+    } catch (e) {
+      return json({ error: 'invalid_moves', message: (e as Error).message }, 400);
+    }
+  } else {
+    return json({ error: 'missing_pgn_or_moves' }, 400);
+  }
+
+  const history = chess.history();
+
+  // Sinh list of FEN cho mỗi position (ply 0 = vị trí ban đầu, ply N = sau nước thứ N)
+  const fens: Array<{ ply: number; fen: string }> = [];
+  const tempChess = new Chess();
+  fens.push({ ply: 0, fen: tempChess.fen() });
+  for (const san of history) {
+    try {
+      tempChess.move(san);
+    } catch (e) {
+      break;
+    }
+    fens.push({ ply: fens.length, fen: tempChess.fen() });
+  }
+
+  // Batch gọi Lichess API (5 requests song song để tránh rate limit)
+  const BATCH_SIZE = 5;
+  const positions: Array<{
+    ply: number;
+    fen: string;
+    eval?: { score: { type: string; value: number }; pv: string[]; depth: number };
+    multipv?: Array<{ score: { type: string; value: number }; pv: string[]; depth: number }>;
+    opening?: { eco: string; name: string };
+    error?: string;
+  }> = [];
+
+  for (let i = 0; i < fens.length; i += BATCH_SIZE) {
+    const batch = fens.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async ({ ply, fen }) => {
+        const eval_ = await lichessEval(fen, 3);
+        if (!eval_) {
+          return { ply, fen, error: 'lichess_unavailable' };
+        }
+
+        // Convert UCI moves sang SAN bằng chess.js (replay từ FEN)
+        const convertLine = (line: { moves: string; cp: number | null; mate: number | null }) => {
+          const ch = new Chess();
+          ch.load(fen);
+          const sans: string[] = [];
+          const ucis = line.moves.trim().split(/\s+/);
+          for (const u of ucis) {
+            if (u.length < 4) break;
+            try {
+              const mv = ch.move({
+                from: u.slice(0, 2),
+                to: u.slice(2, 4),
+                promotion: u.length > 4 ? u[4] : undefined,
+              });
+              if (mv) sans.push(mv.san);
+              else break;
+            } catch {
+              break;
+            }
+          }
+          const score = line.mate != null
+            ? { type: 'mate', value: line.mate }
+            : { type: 'cp', value: line.cp ?? 0 };
+          return { score, pv: sans, depth: eval_.depth };
+        };
+
+        const multipv = (eval_.pvs || []).map(convertLine);
+        const top = multipv[0] || { score: { type: 'cp', value: 0 }, pv: [], depth: 0 };
+
+        return {
+          ply,
+          fen,
+          eval: top,
+          multipv,
+          opening: eval_.opening,
+        };
+      })
+    );
+    positions.push(...batchResults);
+  }
+
+  return json({
+    ok: true,
+    moves: history,
+    positions,
+    cached: positions.filter((p) => !p.error).length,
+    errors: positions.filter((p) => p.error).length,
+  });
+}
+
 
 interface GameState {
   fen: string;

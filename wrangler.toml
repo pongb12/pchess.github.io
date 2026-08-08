@@ -1,6 +1,6 @@
 name = "pchess-github-io"
 main = "src/index.ts"
-compatibility_date = "2026-08-06"
+compatibility_date = "2024-09-23"
 
 # Static assets: worker serve qua binding ASSETS (chỉ index.html, css, js)
 [assets]

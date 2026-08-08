@@ -2645,8 +2645,7 @@ const Analysis = {
         this.index = -1;
         this.failed = false;
         this.pendingStartAfterReady = false;
-        this.setEngineStatus('Đang tải Stockfish...');
-        this.ensureEngine();
+        this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi PGN lên server.');
         this.goTo(0);
     },
 
@@ -2671,8 +2670,7 @@ const Analysis = {
             this.pendingStartAfterReady = false;
             document.getElementById('pgn-modal').classList.add('hidden');
             document.getElementById('pgn-input').value = '';
-            this.setEngineStatus('Đang tải Stockfish...');
-            this.ensureEngine();
+            this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi PGN lên server.');
             this.goTo(0);
             this.show();
             showToast('Đã nạp PGN: ' + moves.length + ' nước', 'success');
@@ -2694,316 +2692,237 @@ const Analysis = {
         } else {
             document.getElementById('landing-page').classList.add('active');
         }
-        this.stopEngine();
+        // Hủy request đang chạy nếu user exit giữa chừng
+        this._abortRequest();
     },
+
+    // ===== Server-side analysis: gọi /api/analyze =====
+    // Không còn chạy Stockfish local. Server sẽ:
+    // 1. Parse PGN thành list of FEN
+    // 2. Gọi Lichess Cloud Eval API cho mỗi position (multi-PV 3)
+    // 3. Trả về JSON có eval + multi-PV + opening name sẵn
+    // Client chỉ việc hiển thị kết quả.
+    //
+    // Lợi ích:
+    // - Không tải Stockfish WASM 108MB trên browser
+    // - Không phụ thuộc browser capability (CSP, Worker, Blob URL, WASM compile)
+    // - Server cache kết quả (Cloudflare edge cache 24h)
+    // - Lichess API có depth ~30 (mạnh hơn Lite local)
 
     ensureEngine() {
-        if (this.engine || this.failed) return;
-        this.setEngineStatus('Đang tải Stockfish...');
-        const gen = ++this._gen;
-        const startMode = this._engineMode; // ghi lại mode dự định
-        this.engineUrl().then((res) => {
-            // Đã exit/stop giữa lúc đọc IndexedDB thì bỏ qua
-            if (gen !== this._gen || this.engine || this.failed) return;
-            this.setEngineStatus(this._engineMode === 'full'
-                ? 'Đang khởi tạo Worker bản Full (~108MB WASM — có thể mất 30-120s để compile trên máy chậm)...'
-                : 'Đang khởi tạo Worker bản Lite...');
-            try {
-                this.engine = new Worker(res.url);
-                this.engineUrlValue = res.revokeUrl;
-            } catch (err) {
-                // CSP hoặc browser không hỗ trợ Blob URL worker
-                this._tryFallbackToLite('Không tạo được worker: ' + err.message, gen);
-                return;
-            }
-            this.engine.onerror = (e) => {
-                // Worker throw error hoặc fail load. Có thể là WASM compile lỗi,
-                // fetch wasmUrl fail, hoặc CSP chặn.
-                const msg = e.message || (e.filename ? ('tại ' + e.filename.split('/').pop() + ':' + e.lineno) : 'worker error');
-                this._tryFallbackToLite('Stockfish lỗi: ' + msg, gen);
-                return;
-            };
-            this.engine.onmessage = (e) => this.onEngineMessage(e.data);
-            // CHỈ gửi 'uci' trước. setoption MultiPV và isready sẽ gửi SAU uciok
-            // (đúng UCI protocol — một số engine bỏ qua setoption nếu gửi quá sớm).
-            this.engine.postMessage('uci');
-
-            // Heartbeat: cập nhật status sau 30s nếu vẫn đang đợi, để user biết
-            // engine vẫn đang compile chứ không bị treo.
-            if (this._heartbeatTimer) clearTimeout(this._heartbeatTimer);
-            this._heartbeatTimer = setTimeout(() => {
-                if (gen !== this._gen) return;
-                if (!this.ready && !this.failed && this._engineMode === 'full') {
-                    this.setEngineStatus('Vẫn đang compile WASM (108MB). Vui lòng đợi thêm — có thể mất đến 5 phút trên máy yếu...');
-                }
-            }, 30000);
-
-            // Watchdog: bản Full có thể cần đến 5 phút để compile WASM trên máy chậm.
-            // Lite chỉ cần 30s.
-            const timeout = (this._engineMode === 'full') ? 300000 : 30000;
-            if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
-            this._watchdogTimer = setTimeout(() => {
-                if (gen !== this._gen) return;
-                if (!this.ready && !this.failed) {
-                    this._tryFallbackToLite('Stockfish không phản hồi sau ' + (timeout / 1000) + 's', gen);
-                }
-            }, timeout);
-        }).catch((err) => {
-            if (gen !== this._gen) return;
-            this._tryFallbackToLite(err && err.message ? err.message : 'Không tải được engine', gen);
-        });
+        // No-op: không còn engine local. Giữ method để backward compat.
+        this.ready = true;
+        this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi PGN lên server.');
     },
 
-    // Fallback: nếu bản Full fail (timeout/error), thử lại với bản Lite.
-    // Chỉ fallback một lần — nếu Lite cũng fail thì báo lỗi thật.
-    _tryFallbackToLite(reason, gen) {
-        // Cleanup engine hiện tại
-        if (this.engine) {
-            try { this.engine.terminate(); } catch (e) { /* ignore */ }
-            this.engine = null;
-        }
-        this.revokeEngineUrls();
-        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
-
-        // Nếu đang dùng full (hoặc auto chọn full), thử lite
-        if (this._engineMode === 'full' && !this._fallbackTried) {
-            this._fallbackTried = true;
-            debugLog('warn', 'Stockfish bản Full thất bại:', reason, '— thử bản Lite');
-            this.setEngineStatus('Bản Full thất bại (' + reason + '). Đang thử bản Lite...');
-            // Force dùng lite
-            this._engineMode = 'lite';
-            this._forceLite = true;
-            // Đợi 500ms rồi retry
-            setTimeout(() => {
-                if (gen !== this._gen) return;
-                this.ensureEngine();
-            }, 500);
-            return;
-        }
-
-        // Lite cũng fail hoặc đã fallback rồi
-        this.engineFailed(reason + (this._fallbackTried ? ' (đã thử bản Lite cũng fail)' : ''));
-    },
-
-    // Kiểm tra xem bản Full đã cài trong IndexedDB chưa.
-    // QUAN TRỌNG: nay Full có thể load từ CDN nên không cần IndexedDB nữa.
-    // Luôn trả về true nếu mode='full' hoặc 'auto' (cho phép thử CDN),
-    // trừ khi user đang ở chế độ 'lite' tường minh.
-    async _hasFullEngine() {
-        // Nếu user đã download Full vào IndexedDB → dùng cache JS để tiết kiệm request
-        try {
-            const js = await EngineStore.load('engine-full');
-            const wasm = await EngineStore.load('engine-full-wasm');
-            if (js && wasm && wasm.size >= 50 * 1048576) {
-                this._hasFullInIDB = true;
-                return true;
-            }
-        } catch (e) { /* ignore */ }
-        // Không có IndexedDB vẫn cho phép Full (sẽ load từ CDN)
-        this._hasFullInIDB = false;
-        return true;
-    },
-
-    // Trả về { url, revokeUrl }.
-    // - Lite: tải từ server local (cùng origin, ~7MB, instant)
-    // - Full: tải từ CDN (unpkg) thay vì IndexedDB.
-    //   Lý do: WebAssembly.instantiateStreaming không stream đúng với Blob URL
-    //   (buffer toàn bộ 108MB rồi mới compile → treo 5-10 phút).
-    //   Với CDN HTTP URL, trình duyệt stream + compile song song (nhanh hơn 5-10x).
-    //   Browser HTTP cache sẽ cache WASM sau lần đầu, các lần sau nhanh như local.
-    //   IndexedDB vẫn giữ làm fallback offline khi CDN fail.
-    async engineUrl() {
-        // Nếu đã force dùng lite (do full fail trước đó), luôn dùng lite
-        const settingsMode = (window.game && window.game.settings && window.game.settings.engine) || 'auto';
-        let mode = settingsMode;
-        if (this._forceLite) {
-            mode = 'lite';
-        } else if (mode === 'lite' || mode === 'auto') {
-            const hasFull = await this._hasFullEngine();
-            if (hasFull) mode = 'full';
-        }
-        this._engineMode = mode;
-
-        if (mode !== 'full') {
-            this.setEngineStatus('Đang tải Stockfish (lite ~7MB từ server)...');
-            return { url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null };
-        }
-
-        // Full mode: load từ CDN để instantiateStreaming hoạt động đúng.
-        const cdnBase = 'https://unpkg.com/stockfish@18.0.8/bin/';
-        const wasmCdnUrl = cdnBase + 'stockfish-18-single.wasm';
-        const jsCdnUrl = cdnBase + 'stockfish-18-single.js';
-
-        this.setEngineStatus('Đang tải Stockfish Full từ CDN (unpkg, ~108MB — stream compile)...');
-
-        // JS file nhỏ (~150KB), fetch as text rồi tạo Blob URL vì new Worker()
-        // yêu cầu same-origin. Thử IndexedDB cache trước để tiết kiệm 1 request.
-        let src = null;
-        try {
-            const cachedJs = await EngineStore.load('engine-full');
-            if (cachedJs && cachedJs.size > 5000) {
-                src = await cachedJs.text();
-                this.setEngineStatus('Đã dùng JS cache本地. Đang khởi tạo Worker (WASM tải từ CDN, stream compile)...');
-            }
-        } catch (e) { /* ignore — fall back to CDN */ }
-
-        if (!src) {
-            try {
-                const res = await fetch(jsCdnUrl);
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                src = await res.text();
-            } catch (e) {
-                // CDN fail — thử IndexedDB (nếu user đã từng download)
-                this.setEngineStatus('CDN fail, thử IndexedDB...');
-                const cachedJs = await EngineStore.load('engine-full');
-                const cachedWasm = await EngineStore.load('engine-full-wasm');
-                if (cachedJs && cachedWasm) {
-                    // Fallback IndexedDB (có thể chậm nhưng offline được)
-                    this.setEngineStatus('Đang load bản Full từ IndexedDB (offline mode, có thể chậm)...');
-                    const jsUrl = URL.createObjectURL(new Blob([await cachedJs.text()], { type: 'text/javascript' }));
-                    const wasmUrl = URL.createObjectURL(cachedWasm);
-                    return {
-                        url: jsUrl + '#' + encodeURIComponent(wasmUrl) + ',worker',
-                        revokeUrl: [jsUrl, wasmUrl]
-                    };
-                }
-                throw new Error('Không tải được JS từ CDN và không có cache IndexedDB: ' + e.message);
-            }
-        }
-
-        if (src.length < 5000 || src.indexOf('stockfish') === -1) {
-            throw new Error('File stockfish-18-single.js không đúng phiên bản (size ' + src.length + ' bytes).');
-        }
-
-        const jsBlobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
-        // Worker sẽ fetch WASM từ CDN — HTTP streaming → instantiateStreaming
-        // compile song song với download (không buffer toàn bộ rồi mới compile).
-        this.setEngineStatus('Đang khởi tạo Worker + tải WASM từ CDN (stream compile)...');
-        return {
-            url: jsBlobUrl + '#' + encodeURIComponent(wasmCdnUrl) + ',worker',
-            revokeUrl: [jsBlobUrl]
-        };
+    engineUrl() {
+        // No-op: không còn engine URL.
+        return Promise.resolve({ url: '', revokeUrl: null });
     },
 
     engineFailed(msg) {
         this.failed = true;
-        // Clear timers nếu có
-        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.setEngineStatus('⚠️ ' + msg, true);
-        if (this.engine) {
-            try { this.engine.terminate(); } catch (e) { /* ignore */ }
-            this.engine = null;
-        }
-        this.revokeEngineUrls();
     },
 
     revokeEngineUrls() {
-        if (!this.engineUrlValue) return;
-        const urls = Array.isArray(this.engineUrlValue) ? this.engineUrlValue : [this.engineUrlValue];
-        for (const url of urls) {
-            if (url && url.indexOf('blob:') === 0) {
-                try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
-            }
-        }
-        this.engineUrlValue = null;
+        // No-op.
     },
 
     stopEngine() {
-        if (this.engine) {
-            try {
-                this.engine.postMessage('quit');
-                this.engine.terminate();
-            } catch (e) { /* ignore */ }
-            this.engine = null;
-        }
-        this.revokeEngineUrls();
+        this._abortRequest();
         this.ready = false;
         this.failed = false;
-        // Reset fallback flags để user có thể retry bản Full sau khi exit
-        this._forceLite = false;
-        this._fallbackTried = false;
-        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.pendingPly = null;
         this.requestPly = null;
         this.batchQueue = null;
         this._gen++;
     },
 
-    onEngineMessage(data) {
-        if (typeof data !== 'string') return;
-        // Khi nhận bất kỳ message nào từ worker, clear heartbeat (engine đã start)
-        if (this._heartbeatTimer) {
-            clearTimeout(this._heartbeatTimer);
-            this._heartbeatTimer = null;
+    // Hủy request đang chạy (khi user exit hoặc start lại)
+    _abortRequest() {
+        if (this._abortController) {
+            try { this._abortController.abort(); } catch (e) { /* ignore */ }
+            this._abortController = null;
         }
-        if (data === 'uciok') {
-            // Sau uciok mới gửi setoption và isready (đúng UCI protocol).
-            // Trước đây gửi setoption trước uciok — một số engine bỏ qua.
-            this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
-            this.engine.postMessage('isready');
-            this.setEngineStatus('Đang chờ Stockfish ready (compile WASM)...');
-            return;
-        }
-        if (data === 'readyok') {
-            this.ready = true;
-            this.failed = false;
-            // Clear watchdog vì engine đã respond
-            if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-            this.setEngineStatus('Stockfish 18 sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', mode ' + (this._engineMode || '?') + ')');
-            this.analyzeCurrent();
-            if (this.pendingStartAfterReady) {
-                this.pendingStartAfterReady = false;
-                this.analyzeAll();
-            }
-            return;
-        }
-        if (data.indexOf('info depth') === 0) {
-            const ply = this.pendingPly;
-            if (ply == null) return;
-            // Parse MultiPV: Stockfish gửi nhiều dòng "info ... multipv N ..."
-            // mỗi dòng là 1 PV. Khi MultiPV=1, không có trường multipv -> mặc định 1.
-            const mpvMatch = data.match(/multipv (\d+)/);
-            const mpvIdx = mpvMatch ? parseInt(mpvMatch[1], 10) : 1;
-            const score = this.parseScore(data);
-            const pv = this.parsePv(data, ply);
-            const depth = this.parseDepth(data);
-            if (score != null) {
-                // Lưu trữ theo cấu trúc: evals[ply].score = best (PV 1), evals[ply].multipv[idx-1] = {...}
-                if (!this.evals[ply]) this.evals[ply] = {};
-                if (mpvIdx === 1) {
-                    // Top PV — dùng cho classification + chart
-                    this.evals[ply].score = score;
-                    this.evals[ply].pv = pv;
-                    this.evals[ply].depth = depth;
-                }
-                if (!this.evals[ply].multipv) this.evals[ply].multipv = [];
-                this.evals[ply].multipv[mpvIdx - 1] = { score, pv, depth };
-            }
-            if (ply === this.index) this.renderEval(ply);
-            return;
-        }
-        if (data.indexOf('bestmove') === 0) {
-            const ply = this.pendingPly;
-            if (ply != null && ply === this.index) {
-                this.renderEval(ply);
-                this.renderMultiPV(ply);
-            }
-            this.pendingPly = null;
-            // Đang chạy "phân tích toàn bộ": cập nhật nhãn rồi sang vị trí kế tiếp
-            if (this.batchQueue) {
-                this.classify();
-                this.renderMoveList();
-                this.processBatch();
-                return;
-            }
-            // Có vị trí mới được yêu cầu khi đang search: làm ngay bây giờ
-            if (this.requestPly != null) this.analyzeCurrent();
+        if (this._progressTimer) {
+            clearInterval(this._progressTimer);
+            this._progressTimer = null;
         }
     },
 
+    // ===== Phân tích toàn bộ ván qua server =====
+    startFullAnalysis() {
+        if (!this.pgnMoves.length) {
+            showToast('Chưa có ván cờ nào để phân tích', 'warning');
+            return;
+        }
+        if (this.batchQueue) {
+            showToast('Đang phân tích...', 'info');
+            return;
+        }
+        this._runServerAnalysis();
+    },
+
+    async _runServerAnalysis() {
+        // Hủy request cũ nếu có
+        this._abortRequest();
+        this._abortController = new AbortController();
+        const gen = this._gen;
+        const totalPlys = this.pgnMoves.length + 1; // +1 cho position ban đầu
+
+        // Progress tracking
+        let elapsed = 0;
+        this._progressTimer = setInterval(() => {
+            if (gen !== this._gen) return;
+            elapsed++;
+            const rate = totalPlys / Math.max(1, elapsed); // positions per second (rough)
+            const eta = Math.ceil((totalPlys - 0) / Math.max(1, rate)); // very rough
+            this.setEngineStatus(`Đang phân tích trên server (Lichess API) — đã ${elapsed}s, ước tính ~${eta}s còn lại...`);
+        }, 1000);
+
+        this.setEngineStatus('Đang gửi PGN lên server...');
+        this.batchQueue = [0]; // Đánh dấu đang chạy
+
+        try {
+            const resp = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ moves: this.pgnMoves }),
+                signal: this._abortController.signal,
+            });
+
+            if (gen !== this._gen) return; // user đã exit
+
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.message || 'HTTP ' + resp.status);
+            }
+
+            const data = await resp.json();
+            if (gen !== this._gen) return;
+
+            // Map positions về evals (client-side format)
+            for (const pos of data.positions) {
+                if (pos.error) {
+                    // Lichess không trả về được position này — skip
+                    continue;
+                }
+                if (pos.eval && pos.eval.score) {
+                    this.evals[pos.ply] = {
+                        score: { type: pos.eval.score.type, value: pos.eval.score.value },
+                        pv: pos.eval.pv || [],
+                        depth: pos.eval.depth || 0,
+                        multipv: (pos.multipv || []).map(m => ({
+                            score: { type: m.score.type, value: m.score.value },
+                            pv: m.pv || [],
+                            depth: m.depth || 0
+                        }))
+                    };
+                }
+                // Cache opening name cho ply này
+                if (pos.opening && pos.opening.name) {
+                    if (!this._openingCache) this._openingCache = {};
+                    this._openingCache[pos.ply] = pos.opening;
+                }
+            }
+
+            this.batchQueue = null;
+            this.classify();
+            this.renderMoveList();
+            this.goTo(this.index < 0 ? 0 : this.index); // re-render với data mới
+            this.renderPhaseStats();
+
+            const okCount = (data.positions || []).filter(p => !p.error).length;
+            const errCount = (data.positions || []).filter(p => p.error).length;
+            if (errCount > 0 && okCount === 0) {
+                this.setEngineStatus(`⚠️ Lichess API không khả dụng (${errCount} positions fail). Thử lại sau.`, true);
+                showToast('Phân tích thất bại — Lichess API không phản hồi', 'error');
+            } else if (errCount > 0) {
+                this.setEngineStatus(`Đã phân tích xong ${okCount}/${data.positions.length} positions (${errCount} fail — Lichess rate limit hoặc lỗi mạng).`);
+                showToast(`Đã phân tích xong (${okCount}/${data.positions.length} positions)`, 'success');
+            } else {
+                this.setEngineStatus(`Đã phân tích xong toàn bộ ván (${okCount} positions, depth ~30, multi-PV 3)`);
+                showToast('Đã phân tích xong toàn bộ ván', 'success');
+            }
+        } catch (err) {
+            if (gen !== this._gen) return;
+            if (err.name === 'AbortError') {
+                this.batchQueue = null;
+                this.setEngineStatus('Đã hủy phân tích.');
+                return;
+            }
+            this.batchQueue = null;
+            this.setEngineStatus('⚠️ Lỗi: ' + (err.message || err), true);
+            showToast('Phân tích thất bại: ' + (err.message || err), 'error');
+        } finally {
+            if (this._progressTimer) {
+                clearInterval(this._progressTimer);
+                this._progressTimer = null;
+            }
+        }
+    },
+
+    // ===== Single-position analysis (khi user click vào 1 position) =====
+    // Server đã trả về tất cả positions trong startFullAnalysis, nên ta chỉ cần
+    // lookup từ cache. Nếu chưa có, gọi nhanh 1 request riêng.
+    async analyzeCurrent() {
+        if (this.index < 0 || this.index > this.pgnMoves.length) return;
+        // Nếu đã có eval từ batch analysis, render luôn
+        if (this.evals[this.index]) {
+            this.renderEval(this.index);
+            this.renderMultiPV(this.index);
+            return;
+        }
+        // Nếu chưa có (user click position chưa phân tích), gọi 1 request riêng
+        if (this.pendingPly != null) return;
+        this.pendingPly = this.index;
+        this.setEngineStatus('Đang phân tích position ' + this.index + ' trên server...');
+
+        try {
+            const resp = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ moves: this.pgnMoves.slice(0, this.index) }),
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            const pos = data.positions && data.positions[data.positions.length - 1];
+            if (pos && !pos.error && pos.eval) {
+                this.evals[pos.ply] = {
+                    score: { type: pos.eval.score.type, value: pos.eval.score.value },
+                    pv: pos.eval.pv || [],
+                    depth: pos.eval.depth || 0,
+                    multipv: (pos.multipv || []).map(m => ({
+                        score: { type: m.score.type, value: m.score.value },
+                        pv: m.pv || [],
+                        depth: m.depth || 0
+                    }))
+                };
+                if (pos.opening) {
+                    if (!this._openingCache) this._openingCache = {};
+                    this._openingCache[pos.ply] = pos.opening;
+                }
+                this.renderEval(pos.ply);
+                this.renderMultiPV(pos.ply);
+                this.renderOpeningName(pos.ply);
+                this.setEngineStatus('Đã phân tích position ' + pos.ply + ' (Lichess API, depth ~' + (pos.eval.depth || '?') + ')');
+            } else {
+                this.setEngineStatus('⚠️ Lichess API không trả về được position này', true);
+            }
+        } catch (err) {
+            this.setEngineStatus('⚠️ Lỗi: ' + (err.message || err), true);
+        } finally {
+            this.pendingPly = null;
+        }
+    },
+
+    // ===== Dummy methods (giữ để backward compat, không dùng nữa) =====
+    _tryFallbackToLite() { /* no-op */ },
+    _hasFullEngine() { return Promise.resolve(false); },
+    // (engineUrl, engineFailed, revokeEngineUrls, stopEngine đã được định nghĩa ở trên)
+
+    // ===== Helpers để convert UCI → SAN (dùng cho single-position analysis) =====
     parseScore(line) {
         const m = line.match(/score (cp|mate) (-?\d+)/);
         if (!m) return null;
@@ -3041,6 +2960,8 @@ const Analysis = {
         }
         return sans;
     },
+
+    onEngineMessage() { /* no-op: không còn engine local */ },
 
     goTo(idx) {
         const maxIdx = this.pgnMoves.length;
@@ -3127,6 +3048,14 @@ const Analysis = {
     renderOpeningName(idx) {
         const el = document.getElementById('analysis-opening-name');
         if (!el) return;
+        // Ưu tiên opening name từ Lichess API (server trả về, có ECO code)
+        if (this._openingCache && this._openingCache[idx] && this._openingCache[idx].name) {
+            const op = this._openingCache[idx];
+            el.textContent = 'Khai cuộc: ' + op.name;
+            el.title = 'ECO ' + op.eco + ' — ' + op.name;
+            return;
+        }
+        // Fallback: detect từ database local (ít chính xác hơn)
         const matched = this.detectOpening(this.pgnMoves.slice(0, idx));
         if (matched) {
             el.textContent = 'Khai cuộc: ' + matched.name;
