@@ -102,6 +102,13 @@
                         </div>
                     </div>
                     <div class="header-right">
+                        <button id="btn-game-analyze" class="btn btn-secondary header-analyze-btn" title="Phân tích ván ngay (không cần kết thúc ván)">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="7"></circle>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                            </svg>
+                            <span class="analyze-btn-label">Phân tích</span>
+                        </button>
                         <button id="btn-game-settings" class="btn btn-icon" title="Cài đặt">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <circle cx="12" cy="12" r="3"></circle>
@@ -322,6 +329,43 @@
                             </select>
                         </div>
                     </div>
+
+                    <div class="setting-group">
+                        <h3>🧠 Stockfish</h3>
+                        <div class="setting-row">
+                            <label>Engine</label>
+                            <select id="setting-engine">
+                                <option value="lite">Lite (mặc định)</option>
+                                <option value="full">Full (file của bạn)</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label>File Full</label>
+                            <div class="engine-import-row">
+                                <span id="engine-full-status" class="engine-full-status">Chưa cài</span>
+                                <button id="btn-clear-engine" class="btn btn-secondary" type="button">Xóa</button>
+                            </div>
+                        </div>
+                        <div class="setting-row setting-hint-row">
+                            <span class="setting-hint">Bản Full mạnh hơn rất nhiều nhưng nặng (~108MB). Ấn nút dưới để tự tải về và lưu trong trình duyệt này (IndexedDB) — không tải lên server.</span>
+                        </div>
+                        <div class="setting-row">
+                            <button id="btn-download-engine" class="btn btn-primary" type="button">⬇ Tự tải bản Full (~108MB)</button>
+                        </div>
+                        <div class="setting-row setting-hint-row" id="engine-download-progress-wrap" style="display:none">
+                            <div class="engine-download-progress">
+                                <div id="engine-download-bar" class="engine-download-bar"></div>
+                            </div>
+                            <span id="engine-download-text" class="engine-full-status"></span>
+                        </div>
+                        <div class="setting-row setting-hint-row">
+                            <span class="setting-hint">Hoặc chọn thủ công 2 file <code>stockfish-18-single.js</code> và <code>stockfish-18-single.wasm</code>:</span>
+                        </div>
+                        <div class="setting-row">
+                            <button id="btn-import-engine" class="btn btn-secondary" type="button">Chọn file (js + wasm)</button>
+                            <input type="file" id="engine-file-input" accept=".js,.wasm,application/javascript,text/javascript,application/wasm" multiple hidden>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="settings-footer">
@@ -381,8 +425,9 @@
                     <span id="analysis-engine-status" class="analysis-engine-status">Đang tải Stockfish...</span>
                 </div>
                 <div class="analysis-actions">
-                    <button id="btn-analysis-pgn" class="btn btn-secondary">📥 Nhập PGN</button>
-                    <button id="btn-analysis-export" class="btn btn-secondary">📋 Xuất PGN</button>
+                    <button id="btn-analysis-start" class="btn btn-primary">▶ Bắt đầu phân tích</button>
+                    <button id="btn-analysis-pgn" class="btn btn-secondary">Nhập PGN</button>
+                    <button id="btn-analysis-export" class="btn btn-secondary">Xuất PGN</button>
                 </div>
             </header>
 
@@ -411,6 +456,17 @@
                     <div class="panel-section">
                         <h3>Biến tốt nhất</h3>
                         <div id="analysis-pv" class="analysis-pv">—</div>
+                    </div>
+                    <div class="panel-section">
+                        <h3>Thống kê phân loại</h3>
+                        <div id="analysis-classification-stats" class="analysis-classification-stats"></div>
+                    </div>
+                    <div class="panel-section">
+                        <h3>Biểu đồ áp đảo</h3>
+                        <div class="analysis-chart-wrap">
+                            <svg id="analysis-chart" class="analysis-chart" viewBox="0 0 600 220" preserveAspectRatio="none"></svg>
+                            <div id="analysis-chart-empty" class="analysis-chart-empty">Chưa có dữ liệu. Ấn "Bắt đầu phân tích"</div>
+                        </div>
                     </div>
                     <div class="panel-section">
                         <h3>Nước đi & Đánh giá</h3>

@@ -21,6 +21,83 @@ function getPieceUrl(color, type) {
     return CONFIG.PIECE_BASE_URL + '/' + CONFIG.PIECES[color][type];
 }
 
+// ===== EngineStore (IndexedDB): lưu bản Stockfish Full do người dùng tự cài =====
+// localStorage chỉ đủ ~5MB nên file engine (~100MB) phải dùng IndexedDB.
+const EngineStore = {
+    DB_NAME: 'pchess',
+    STORE: 'engines',
+    _db: null,
+
+    open() {
+        if (this._db) return Promise.resolve(this._db);
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(this.DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                if (!req.result.objectStoreNames.contains(this.STORE)) {
+                    req.result.createObjectStore(this.STORE);
+                }
+            };
+            req.onsuccess = () => {
+                this._db = req.result;
+                resolve(req.result);
+            };
+            req.onerror = () => reject(req.error || new Error('Không mở được IndexedDB'));
+        });
+    },
+
+    async save(key, blob) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this.STORE, 'readwrite');
+            tx.objectStore(this.STORE).put(blob, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('Lưu IndexedDB thất bại'));
+        });
+    },
+
+    async load(key) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const req = db.transaction(this.STORE, 'readonly').objectStore(this.STORE).get(key);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error || new Error('Đọc IndexedDB thất bại'));
+        });
+    },
+
+    async delete(key) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this.STORE, 'readwrite');
+            tx.objectStore(this.STORE).delete(key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('Xóa IndexedDB thất bại'));
+        });
+    },
+
+    async size() {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const req = db.transaction(this.STORE, 'readonly').objectStore(this.STORE).getAll();
+            req.onsuccess = () => resolve((req.result || []).reduce((s, b) => s + (b && b.size ? b.size : 0), 0));
+            req.onerror = () => reject(req.error || new Error('Đọc IndexedDB thất bại'));
+        });
+    }
+};
+
+// Chuyển Blob -> base64 (chunked để tránh giữ quá nhiều bản sao trong bộ nhớ)
+// Lưu ý: CH phải chia hết cho 3, nếu không mỗi chunk có padding '=' riêng làm base64 nối lại bị sai.
+function blobToBase64(blob) {
+    return blob.arrayBuffer().then((buf) => {
+        const bytes = new Uint8Array(buf);
+        const chunks = [];
+        const CH = 0x3000;
+        for (let i = 0; i < bytes.length; i += CH) {
+            chunks.push(btoa(String.fromCharCode.apply(null, bytes.subarray(i, i + CH))));
+        }
+        return chunks.join('');
+    });
+}
+
 // ===== Sound Manager (Web Audio API) =====
 class SoundManager {
     constructor() {
@@ -378,6 +455,47 @@ class PChessGame {
             this.settings.timer = parseInt(e.target.value);
             this.saveSettings();
         });
+        document.getElementById('setting-engine').addEventListener('change', (e) => {
+            this.settings.engine = e.target.value;
+            this.saveSettings();
+        });
+        document.getElementById('btn-import-engine').addEventListener('click', () => {
+            document.getElementById('engine-file-input').click();
+        });
+        document.getElementById('engine-file-input').addEventListener('change', async (e) => {
+            const files = e.target.files ? Array.from(e.target.files) : [];
+            e.target.value = '';
+            if (!files.length) return;
+            const js = files.find(f => /\.js$/i.test(f.name));
+            const wasm = files.find(f => /\.wasm$/i.test(f.name));
+            if (!js && !wasm) {
+                showToast('Hãy chọn file .js và .wasm của bản Full', 'warning');
+                return;
+            }
+            showToast('Đang lưu bản Full...', 'info');
+            try {
+                if (js) await EngineStore.save('engine-full', js);
+                if (wasm) await EngineStore.save('engine-full-wasm', wasm);
+                await this.syncEngineStatus();
+                const missing = [];
+                if (!js) missing.push('.js');
+                if (!wasm) missing.push('.wasm');
+                showToast('Đã lưu bản Full' + (missing.length ? ' (thiếu ' + missing.join(', ') + ')' : ''), missing.length ? 'warning' : 'success');
+            } catch (err) {
+                showToast('Lưu thất bại: ' + (err && err.message ? err.message : err), 'error');
+            }
+        });
+        document.getElementById('btn-clear-engine').addEventListener('click', async () => {
+            try {
+                await EngineStore.delete('engine-full');
+                await EngineStore.delete('engine-full-wasm');
+                await this.syncEngineStatus();
+                showToast('Đã xóa bản Full', 'success');
+            } catch (err) {
+                showToast('Xóa thất bại: ' + (err && err.message ? err.message : err), 'error');
+            }
+        });
+        document.getElementById('btn-download-engine').addEventListener('click', () => this.downloadFullEngine());
 
         // Promotion modal
         document.querySelectorAll('.promotion-piece').forEach(btn => {
@@ -406,6 +524,7 @@ class PChessGame {
 
         // Analysis & PGN
         document.getElementById('btn-analyze-game').addEventListener('click', () => this.startAnalysis());
+        document.getElementById('btn-game-analyze').addEventListener('click', () => this.startAnalysis());
         document.getElementById('btn-menu-analyze').addEventListener('click', () => {
             this.closeModal(document.getElementById('menu-modal'));
             this.startAnalysis();
@@ -426,10 +545,87 @@ class PChessGame {
         document.getElementById('setting-animation').checked = this.settings.animation;
         document.getElementById('setting-coords').checked = this.settings.coords;
         document.getElementById('setting-timer').value = this.settings.timer;
+        document.getElementById('setting-engine').value = this.settings.engine || 'lite';
         document.querySelectorAll('.theme-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.theme === this.settings.theme);
         });
         this.soundManager.setEnabled(this.settings.sound);
+        this.syncEngineStatus();
+    }
+
+    async syncEngineStatus() {
+        const el = document.getElementById('engine-full-status');
+        if (!el) return;
+        try {
+            const js = await EngineStore.load('engine-full');
+            const wasm = await EngineStore.load('engine-full-wasm');
+            if (js && wasm) {
+                el.textContent = 'Đã cài (' + ((js.size + wasm.size) / 1048576).toFixed(0) + 'MB)';
+            } else if (js || wasm) {
+                el.textContent = 'Thiếu file ' + (js ? '.wasm' : '.js') + ' — ' +
+                    ((js && js.size || 0) / 1048576).toFixed(0) + 'MB đã lưu';
+            } else {
+                el.textContent = 'Chưa cài';
+            }
+        } catch (e) {
+            el.textContent = 'Lỗi đọc';
+        }
+    }
+
+    // Tự tải bản Full (stockfish-18-single.js + .wasm) từ CDN rồi lưu IndexedDB
+    async downloadFullEngine() {
+        const btn = document.getElementById('btn-download-engine');
+        const wrap = document.getElementById('engine-download-progress-wrap');
+        const bar = document.getElementById('engine-download-bar');
+        const text = document.getElementById('engine-download-text');
+        if (!btn || !wrap || !bar || !text) return;
+        btn.disabled = true;
+        wrap.style.display = 'flex';
+        bar.style.width = '0%';
+        text.textContent = 'Bắt đầu tải...';
+        const base = 'https://unpkg.com/stockfish@18.0.8/bin/';
+        const files = [
+            { name: 'engine-full', url: base + 'stockfish-18-single.js', size: 0 },
+            { name: 'engine-full-wasm', url: base + 'stockfish-18-single.wasm', size: 0 }
+        ];
+        try {
+            for (const f of files) {
+                text.textContent = 'Đang tải ' + (f.name === 'engine-full' ? 'stockfish-18-single.js' : 'stockfish-18-single.wasm (~108MB)') + '...';
+                const res = await fetch(f.url);
+                if (!res.ok || !res.body) throw new Error('Tải về thất bại (HTTP ' + res.status + '). Kiểm tra kết nối mạng.');
+                const total = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
+                const reader = res.body.getReader();
+                const chunks = [];
+                let received = 0;
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    received += value.length;
+                    if (total) {
+                        const pct = Math.min(100, Math.round(received / total * 100));
+                        bar.style.width = pct + '%';
+                        text.textContent = (received / 1048576).toFixed(0) + ' / ' + (total / 1048576).toFixed(0) + ' MB (' + pct + '%)';
+                    } else {
+                        bar.style.width = '30%';
+                        bar.classList.add('indeterminate');
+                        text.textContent = 'Đã tải ' + (received / 1048576).toFixed(0) + ' MB...';
+                    }
+                }
+                bar.classList.remove('indeterminate');
+                const blob = new Blob(chunks, { type: f.name === 'engine-full' ? 'text/javascript' : 'application/wasm' });
+                await EngineStore.save(f.name, blob);
+                f.size = blob.size;
+            }
+            wrap.style.display = 'none';
+            await this.syncEngineStatus();
+            showToast('Đã cài bản Full (' + ((files[0].size + files[1].size) / 1048576).toFixed(0) + 'MB)', 'success');
+        } catch (err) {
+            wrap.style.display = 'none';
+            showToast('Tải bản Full thất bại: ' + (err && err.message ? err.message : err), 'error');
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     // ===== WebSocket Setup =====
@@ -1804,7 +2000,8 @@ class PChessGame {
             sound: true,
             animation: true,
             coords: false,
-            timer: 0
+            timer: 0,
+            engine: 'lite'
         };
 
         try {
@@ -1899,9 +2096,15 @@ const Analysis = {
     result: null,
     index: -1,
     evals: {},
+    classifications: {},
     pendingPly: null,
     requestPly: null,
     posChess: new Chess(),
+    batchQueue: null,
+    pendingStartAfterReady: false,
+    _gen: 0,
+    engineUrlValue: null,
+    BOOK_PLY: 10,
 
     init() {
         document.getElementById('btn-analysis-back').addEventListener('click', () => this.exit());
@@ -1910,17 +2113,31 @@ const Analysis = {
         });
         document.getElementById('btn-pgn-analyze').addEventListener('click', () => this.importFromPgnInput());
         document.getElementById('btn-analysis-export').addEventListener('click', () => this.exportPgn());
+        document.getElementById('btn-analysis-start').addEventListener('click', () => this.startFullAnalysis());
         document.getElementById('btn-an-first').addEventListener('click', () => this.goTo(0));
         document.getElementById('btn-an-prev').addEventListener('click', () => this.goTo(this.index - 1));
         document.getElementById('btn-an-next').addEventListener('click', () => this.goTo(this.index + 1));
         document.getElementById('btn-an-last').addEventListener('click', () => this.goTo(this.pgnMoves.length));
+        document.getElementById('analysis-chart').addEventListener('click', (e) => {
+            const geo = this._chartGeo;
+            if (!geo || !geo.N) return;
+            const rect = document.getElementById('analysis-chart').getBoundingClientRect();
+            const ratio = rect.width ? (e.clientX - rect.left) / rect.width : 0;
+            const frac = Math.max(0, Math.min(1, ratio));
+            const i = Math.round(frac * geo.N);
+            this.goTo(Math.max(0, Math.min(geo.N, i)));
+        });
     },
 
     startFromGame(moves, result) {
         this.pgnMoves = moves.slice();
         this.result = result;
         this.evals = {};
+        this.classifications = {};
+        this.batchQueue = null;
         this.index = -1;
+        this.failed = false;
+        this.pendingStartAfterReady = false;
         this.setEngineStatus('Đang tải Stockfish...');
         this.ensureEngine();
         this.goTo(0);
@@ -1940,7 +2157,11 @@ const Analysis = {
             this.pgnMoves = moves;
             this.result = null;
             this.evals = {};
+            this.classifications = {};
+            this.batchQueue = null;
             this.index = -1;
+            this.failed = false;
+            this.pendingStartAfterReady = false;
             document.getElementById('pgn-modal').classList.add('hidden');
             document.getElementById('pgn-input').value = '';
             this.setEngineStatus('Đang tải Stockfish...');
@@ -1960,30 +2181,72 @@ const Analysis = {
 
     exit() {
         document.getElementById('analysis-page').classList.remove('active');
-        document.getElementById('landing-page').classList.add('active');
+        const g = window.game;
+        if (g && g.wsOpen && g.role) {
+            document.getElementById('game-page').classList.add('active');
+        } else {
+            document.getElementById('landing-page').classList.add('active');
+        }
         this.stopEngine();
     },
 
     ensureEngine() {
         if (this.engine || this.failed) return;
-        try {
-            this.engine = new Worker('stockfish/stockfish-18-lite-single.js');
-        } catch (err) {
-            this.engineFailed('Không tạo được worker: ' + err.message);
-            return;
-        }
-        this.engine.onerror = (e) => {
-            this.engineFailed('Stockfish lỗi: ' + (e.message || 'worker error'));
-        };
-        this.engine.onmessage = (e) => this.onEngineMessage(e.data);
-        this.engine.postMessage('uci');
-        this.engine.postMessage('isready');
-        // Timeout nếu engine không sẵn sàng
-        setTimeout(() => {
-            if (!this.ready && !this.failed) {
-                this.engineFailed('Stockfish không phản hồi (tải WASM quá lâu). Thử lại sau.');
+        this.setEngineStatus('Đang tải Stockfish...');
+        const gen = ++this._gen;
+        this.engineUrl().then((res) => {
+            // Đã exit/stop giữa lúc đọc IndexedDB thì bỏ qua
+            if (gen !== this._gen || this.engine || this.failed) return;
+            try {
+                this.engine = new Worker(res.url);
+                this.engineUrlValue = res.revokeUrl;
+            } catch (err) {
+                this.engineFailed('Không tạo được worker: ' + err.message);
+                return;
             }
-        }, 30000);
+            this.engine.onerror = (e) => {
+                this.engineFailed('Stockfish lỗi: ' + (e.message || 'worker error'));
+            };
+            this.engine.onmessage = (e) => this.onEngineMessage(e.data);
+            this.engine.postMessage('uci');
+            this.engine.postMessage('isready');
+            // Timeout nếu engine không sẵn sàng
+            setTimeout(() => {
+                if (!this.ready && !this.failed) {
+                    this.engineFailed('Stockfish không phản hồi (tải WASM quá lâu). Thử lại sau.');
+                }
+            }, 30000);
+        }).catch((err) => {
+            if (gen !== this._gen) return;
+            this.engineFailed(err && err.message ? err.message : 'Không tải được engine.');
+        });
+    },
+
+    // Trả về { url, revokeUrl }: worker chạy từ blob URL của file js. Worker dạng blob
+    // KHÔNG fetch được blob: URL khác (đã kiểm chứng) nên với bản full ta prepend code
+    // monkeypatch self.fetch: loader sẽ lấy được bytes wasm qua Response() tự dựng —
+    // đã kiểm chứng end-to-end bằng Stockfish 18 thật (uciok -> bestmove).
+    async engineUrl() {
+        const mode = (window.game && window.game.settings && window.game.settings.engine) || 'lite';
+        if (mode !== 'full') {
+            return { url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null };
+        }
+        const js = await EngineStore.load('engine-full');
+        const wasm = await EngineStore.load('engine-full-wasm');
+        if (!js) throw new Error('Chưa cài bản Full. Vào Cài đặt > Stockfish và ấn "Tự tải bản Full" (hoặc chọn thủ công 2 file).');
+        if (!wasm) throw new Error('Thiếu file stockfish-18-single.wasm của bản Full. Vào Cài đặt > Stockfish để cài lại.');
+        if (wasm.size < 50 * 1048576) {
+            throw new Error('File .wasm có vẻ không đúng (quá nhỏ). Hãy cài lại bản Full.');
+        }
+        const b64 = await blobToBase64(wasm);
+        const src = await js.text();
+        if (src.length < 5000 || src.indexOf('stockfish') === -1) {
+            throw new Error('File stockfish-18-single.js không đúng phiên bản. Cài lại bản Full.');
+        }
+        const header = 'var __PCHESS_B64="' + b64 + '";var __PCHESS_BYTES=(function(){var s=atob(__PCHESS_B64),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u})();var __PCHESS_OLD_FETCH=self.fetch;self.fetch=function(i,n){if(typeof i==="string"||(i&&i.url)){return Promise.resolve(new Response(__PCHESS_BYTES,{status:200,headers:{"Content-Type":"application/wasm","Content-Length":__PCHESS_BYTES.length}}));}return __PCHESS_OLD_FETCH(i,n)};';
+        const patched = header + src;
+        const revokeUrl = URL.createObjectURL(new Blob([patched], { type: 'text/javascript' }));
+        return { url: revokeUrl, revokeUrl };
     },
 
     engineFailed(msg) {
@@ -2003,10 +2266,16 @@ const Analysis = {
             } catch (e) { /* ignore */ }
             this.engine = null;
         }
+        if (this.engineUrlValue && this.engineUrlValue.indexOf('blob:') === 0) {
+            try { URL.revokeObjectURL(this.engineUrlValue); } catch (e) { /* ignore */ }
+        }
+        this.engineUrlValue = null;
         this.ready = false;
         this.failed = false;
         this.pendingPly = null;
         this.requestPly = null;
+        this.batchQueue = null;
+        this._gen++;
     },
 
     onEngineMessage(data) {
@@ -2020,6 +2289,10 @@ const Analysis = {
             this.failed = false;
             this.setEngineStatus('Stockfish 18 sẵn sàng');
             this.analyzeCurrent();
+            if (this.pendingStartAfterReady) {
+                this.pendingStartAfterReady = false;
+                this.analyzeAll();
+            }
             return;
         }
         if (data.indexOf('info depth') === 0) {
@@ -2039,6 +2312,13 @@ const Analysis = {
                 this.renderEval(ply);
             }
             this.pendingPly = null;
+            // Đang chạy "phân tích toàn bộ": cập nhật nhãn rồi sang vị trí kế tiếp
+            if (this.batchQueue) {
+                this.classify();
+                this.renderMoveList();
+                this.processBatch();
+                return;
+            }
             // Có vị trí mới được yêu cầu khi đang search: làm ngay bây giờ
             if (this.requestPly != null) this.analyzeCurrent();
         }
@@ -2135,6 +2415,155 @@ const Analysis = {
         this.engine.postMessage('go depth 16');
         document.getElementById('analysis-bestmove').textContent =
             (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
+    },
+
+    // ===== Phân tích toàn bộ ván (chạy tuần tự từng vị trí) =====
+    startFullAnalysis() {
+        if (!this.pgnMoves.length) {
+            showToast('Chưa có ván cờ nào để phân tích', 'warning');
+            return;
+        }
+        if (this.batchQueue) {
+            showToast('Đang phân tích...', 'info');
+            return;
+        }
+        if (this.failed) {
+            showToast('Stockfish không hoạt động, thử lại sau', 'warning');
+            return;
+        }
+        if (!this.ready) {
+            // Chưa tải xong engine: chờ readyok rồi tự chạy phân tích toàn bộ
+            if (!this.engine) {
+                this.setEngineStatus('Đang tải Stockfish...');
+                this.ensureEngine();
+            }
+            this.pendingStartAfterReady = true;
+            return;
+        }
+        this.analyzeAll();
+    },
+
+    analyzeAll() {
+        if (!this.ready) {
+            showToast('Stockfish chưa sẵn sàng, thử lại sau', 'warning');
+            return;
+        }
+        if (!this.pgnMoves.length) {
+            showToast('Chưa có nước đi nào để phân tích', 'warning');
+            return;
+        }
+        if (this.batchQueue) {
+            showToast('Đang phân tích...', 'info');
+            return;
+        }
+        this.batchQueue = [];
+        for (let i = 0; i <= this.pgnMoves.length; i++) this.batchQueue.push(i);
+        this.setEngineStatus('Đang phân tích toàn bộ ván...');
+        this.processBatch();
+    },
+
+    processBatch() {
+        if (!this.batchQueue || !this.batchQueue.length) {
+            this.batchQueue = null;
+            this.classify();
+            this.renderMoveList();
+            this.setEngineStatus('Đã phân tích xong toàn bộ ván');
+            showToast('Đã phân tích xong toàn bộ ván', 'success');
+            return;
+        }
+        // goTo() dựng vị trí + gọi analyzeCurrent (tự serialize chờ bestmove)
+        this.goTo(this.batchQueue.shift());
+    },
+
+    // ===== Phân loại nước đi (kiểu Chess.com — Expected Points model) =====
+    cpOf(score) {
+        if (!score) return null;
+        if (score.type === 'mate') return score.value > 0 ? 100000 - score.value : -(100000 + score.value);
+        return score.value;
+    },
+
+    winPct(cp) {
+        if (cp == null) return null;
+        if (cp >= 100000) return 100;
+        if (cp <= -100000) return 0;
+        // Sigmoid: centipawn -> % thắng (cùng dạng Lichess/Chess.com)
+        return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
+    },
+
+    materialBalance(ch, color) {
+        const val = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+        let b = 0;
+        const board = ch.board();
+        for (let r = 0; r < 8; r++) {
+            for (let f = 0; f < 8; f++) {
+                const p = board[r][f];
+                if (!p) continue;
+                b += (p.color === color ? val[p.type] || 0 : -(val[p.type] || 0));
+            }
+        }
+        return b;
+    },
+
+    buildAt(i) {
+        const ch = new Chess();
+        try {
+            for (let k = 0; k < i; k++) {
+                if (!ch.move(this.pgnMoves[k])) break;
+            }
+        } catch (e) { /* ignore */ }
+        return ch;
+    },
+
+    classifyMove(i) {
+        const before = this.evals[i - 1];
+        const after = this.evals[i];
+        if (!before || !after || !before.score || !after.score) return null;
+        const bestCp = this.cpOf(before.score);
+        const afterCp = this.cpOf(after.score);
+        if (bestCp == null || afterCp == null) return null;
+        const winBefore = this.winPct(bestCp);
+        const winAfter = this.winPct(-afterCp); // eval sau nước là của đối phương -> đổi dấu
+        if (winBefore == null || winAfter == null) return null;
+        const delta = winBefore - winAfter; // % thắng bị mất (0..100)
+
+        const moverColor = (i - 1) % 2 === 0 ? 'w' : 'b';
+        const bestSan = before.pv && before.pv[0];
+        const playedSan = this.pgnMoves[i - 1];
+        const isBest = !!bestSan && bestSan === playedSan;
+
+        // Book: nước mở đầu hợp lý (gần đúng khai cuộc — không có sách khai cuộc thật)
+        if (i <= this.BOOK_PLY && delta <= 5) return { label: 'Book', delta, winBefore, winAfter };
+
+        // Missed: có nước thắng rõ ràng (>= 85% thắng nếu đi đúng) nhưng không chọn
+        if (delta >= 10 && winBefore >= 85) return { label: 'Missed', delta, winBefore, winAfter };
+
+        // Brilliant: nước hay nhất kèm hy sinh quân (mất >= 1 tốt) mà vẫn không thua
+        if (isBest && delta <= 2 && winAfter >= 50 && winBefore <= 95) {
+            const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
+            const bal1 = this.materialBalance(this.buildAt(i), moverColor);
+            if (bal1 < bal0 - 0.9) return { label: 'Brilliant', delta, winBefore, winAfter };
+        }
+
+        // Great: nước "cứu ván" — biến thế thua thành cầm cự/thắng
+        if (delta <= 5 && ((winBefore <= 30 && winAfter >= 50) || (winBefore <= 50 && winAfter >= 75))) {
+            return { label: 'Great', delta, winBefore, winAfter };
+        }
+
+        if (isBest || delta <= 2) return { label: 'Best', delta, winBefore, winAfter };
+        if (delta <= 5) return { label: 'Excellent', delta, winBefore, winAfter };
+        if (delta <= 8) return { label: 'Good', delta, winBefore, winAfter };
+        if (delta <= 12) return { label: 'Inaccuracy', delta, winBefore, winAfter };
+        if (delta <= 20) return { label: 'Mistake', delta, winBefore, winAfter };
+        return { label: 'Blunder', delta, winBefore, winAfter };
+    },
+
+    classify() {
+        const next = {};
+        for (let i = 1; i <= this.pgnMoves.length; i++) {
+            const c = this.classifyMove(i);
+            if (c) next[i] = c;
+        }
+        this.classifications = next;
     },
 
     renderEval(ply) {
@@ -2249,11 +2678,13 @@ const Analysis = {
             const w = document.createElement('span');
             w.className = 'ml-move' + (this.index === i + 1 ? ' active' : '');
             w.textContent = this.pgnMoves[i];
+            this.appendLabel(w, i + 1);
             w.addEventListener('click', () => this.goTo(i + 1));
 
             const b = document.createElement('span');
             b.className = 'ml-move' + (this.index === i + 2 ? ' active' : '');
             b.textContent = this.pgnMoves[i + 1] || '';
+            this.appendLabel(b, i + 2);
             b.addEventListener('click', () => this.goTo(i + 2));
 
             const ev = document.createElement('span');
@@ -2265,6 +2696,174 @@ const Analysis = {
             list.appendChild(b);
             list.appendChild(ev);
         }
+        this.renderChart();
+        this.renderClassificationStats();
+    },
+
+    // ===== Thống kê phân loại nước đi =====
+    async getInlineSvg(fileName) {
+        if (!this._svgCache) this._svgCache = {};
+        if (this._svgCache[fileName]) return this._svgCache[fileName];
+
+        try {
+            const res = await fetch('assets/svg/' + fileName);
+            if (!res.ok) throw new Error();
+            let text = await res.text();
+            // Loại bỏ các thẻ XML và DOCTYPE thừa
+            text = text.replace(/<\?xml[^>]*\?>/i, '')
+                       .replace(/<!DOCTYPE[^>]*>/i, '')
+                       .trim();
+            this._svgCache[fileName] = text;
+            return text;
+        } catch (e) {
+            // Fallback hình tròn đơn giản nếu tải lỗi
+            return `<svg viewBox="0 0 18 19"><circle cx="9" cy="9.5" r="9" fill="currentColor"/></svg>`;
+        }
+    },
+
+    renderClassificationStats() {
+        const container = document.getElementById('analysis-classification-stats');
+        if (!container) return;
+
+        // Tính toán độ chính xác % cho Trắng và Đen
+        let whiteDeltas = [], blackDeltas = [];
+        for (let i = 1; i <= this.pgnMoves.length; i++) {
+            const c = this.classifications[i];
+            if (c && c.delta !== undefined) {
+                // i là số lẻ -> nước đi của Trắng, i số chẵn -> Đen (1-based index)
+                if (i % 2 === 1) {
+                    whiteDeltas.push(c.delta);
+                } else {
+                    blackDeltas.push(c.delta);
+                }
+            }
+        }
+
+        const calcAcc = (deltas) => {
+            if (!deltas.length) return 100;
+            // Công thức xấp xỉ Chess.com từ trung bình mức giảm % thắng (delta)
+            const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+            return Math.max(0, Math.min(100, Math.round(100 - (avg * 2.5))));
+        };
+
+        const whiteAcc = calcAcc(whiteDeltas);
+        const blackAcc = calcAcc(blackDeltas);
+
+        let html = `
+            <div class="cs-accuracy-header">
+                <div class="cs-accuracy-col">
+                    <span class="cs-acc-label">Trắng</span>
+                    <span class="cs-acc-val">${whiteAcc}%</span>
+                </div>
+                <div class="cs-accuracy-divider">Chính xác</div>
+                <div class="cs-accuracy-col">
+                    <span class="cs-acc-label">Đen</span>
+                    <span class="cs-acc-val">${blackAcc}%</span>
+                </div>
+            </div>
+        `;
+
+        // Định nghĩa thứ tự và cấu hình phân loại theo đúng yêu cầu từ trên xuống
+        const classConfig = [
+            { key: 'Brilliant', label: 'Thiên tài', iconFile: 'brilliant.svg', className: 'brilliant' },
+            { key: 'Great', label: 'Great Move', iconFile: 'great_find.svg', className: 'great' },
+            { key: 'Best', label: 'Nước đi tốt nhất', iconFile: 'best.svg', className: 'best' },
+            { key: 'Excellent', label: 'Tuyệt vời', iconFile: 'excellent.svg', className: 'excellent' },
+            { key: 'Good', label: 'Tốt', iconFile: 'good.svg', className: 'good' },
+        ];
+
+        // Đếm các phân loại nước đi từ classifications
+        const counts = {};
+        for (let i = 1; i <= this.pgnMoves.length; i++) {
+            const c = this.classifications[i];
+            if (c) {
+                counts[c.label] = (counts[c.label] || 0) + 1;
+            }
+        }
+
+        // Đếm Book riêng
+        let bookCount = 0;
+        for (let i = 1; i <= this.pgnMoves.length; i++) {
+            const c = this.classifications[i];
+            if (c && c.label === 'Book') {
+                bookCount++;
+            }
+        }
+
+        for (const cfg of classConfig) {
+            const count = counts[cfg.key] || 0;
+            html += `
+                <div class="cs-row ${cfg.className}">
+                    <span class="cs-count">${count}</span>
+                    <div class="cs-main">
+                        <span class="cs-icon" data-icon-file="${cfg.iconFile}"></span>
+                        <span class="cs-name">${cfg.label}</span>
+                    </div>
+                    <span class="cs-count">${count}</span>
+                </div>
+            `;
+        }
+
+        // Thêm các hàng còn lại: Book, Inaccuracy, Mistake, Blunder, Missed
+        const remainingConfig = [
+            { key: 'Book', label: 'Chủ đề sách', iconFile: 'book.svg', className: 'book', customCount: bookCount },
+            { key: 'Inaccuracy', label: 'Không chính xác', iconFile: 'inaccuracy.svg', className: 'inaccuracy' },
+            { key: 'Mistake', label: 'Sai lầm', iconFile: 'mistake.svg', className: 'mistake' },
+            { key: 'Blunder', label: 'Nước sai lầm ngớ ngẩn', iconFile: 'blunder.svg', className: 'blunder' },
+            { key: 'Missed', label: 'Bỏ lỡ', iconFile: 'missed_win.svg', className: 'missed' },
+        ];
+
+        for (const cfg of remainingConfig) {
+            const count = cfg.customCount !== undefined ? cfg.customCount : (counts[cfg.key] || 0);
+            html += `
+                <div class="cs-row ${cfg.className}">
+                    <span class="cs-count">${count}</span>
+                    <div class="cs-main">
+                        <span class="cs-icon" data-icon-file="${cfg.iconFile}"></span>
+                        <span class="cs-name">${cfg.label}</span>
+                    </div>
+                    <span class="cs-count">${count}</span>
+                </div>
+            `;
+        }
+
+        container.innerHTML = html;
+
+        // Tải và chèn SVG inline cho tất cả các icon
+        const placeholders = container.querySelectorAll('.cs-icon');
+        placeholders.forEach(async (el) => {
+            const iconFile = el.getAttribute('data-icon-file');
+            if (iconFile) {
+                const svgText = await this.getInlineSvg(iconFile);
+                el.innerHTML = svgText;
+            }
+        });
+    },
+
+    appendLabel(el, i) {
+        const c = this.classifications[i];
+        if (!c || i > this.pgnMoves.length) return;
+        const badge = document.createElement('span');
+        badge.className = 'ml-label label-' + c.label.toLowerCase();
+        badge.textContent = this.labelText(c.label);
+        badge.title = c.label + ' — mất ' + c.delta.toFixed(1) + '% thắng cờ';
+        el.appendChild(badge);
+    },
+
+    labelText(label) {
+        const map = {
+            Brilliant: '!!',
+            Great: '!',
+            Best: '★',
+            Excellent: '✓',
+            Good: '≈',
+            Book: 'B',
+            Inaccuracy: '?!',
+            Mistake: '?',
+            Missed: '−',
+            Blunder: '??'
+        };
+        return map[label] || label;
     },
 
     renderPgnText() {
@@ -2274,6 +2873,85 @@ const Analysis = {
             s += this.pgnMoves[i] + ' ';
         }
         document.getElementById('analysis-pgn-text').value = s.trim();
+    },
+
+    // ===== Biểu đồ áp đảo (advantage chart) =====
+    // Eval sau ply lẻ là của Đen -> đổi dấu để quy về % thắng của Trắng
+    whiteWinPct(ply) {
+        const ev = this.evals[ply];
+        if (!ev || !ev.score) return null;
+        const cp = this.cpOf(ev.score);
+        if (cp == null) return null;
+        const w = this.winPct(cp);
+        if (w == null) return null;
+        return ply % 2 === 1 ? 100 - w : w;
+    },
+
+    renderChart() {
+        const svg = document.getElementById('analysis-chart');
+        const empty = document.getElementById('analysis-chart-empty');
+        if (!svg || !empty) return;
+        const N = this.pgnMoves.length;
+        const W = 600, H = 220, padL = 26, padR = 16, padT = 10, padB = 20;
+        const xMin = padL, xMax = W - padR, yMin = padT, yMax = H - padB;
+        const xs = (i) => (N <= 0 ? (xMin + xMax) / 2 : xMin + (xMax - xMin) * (i / N));
+        const ys = (wp) => yMax - (yMax - yMin) * (wp / 100);
+
+        let points = [];
+        let hasData = false;
+        let last = null;
+        for (let i = 0; i <= N; i++) {
+            let wp = this.whiteWinPct(i);
+            if (wp != null) {
+                hasData = true;
+                last = wp;
+            } else if (last != null) {
+                wp = last; // nước chưa đánh giá: kéo dài giá trị gần nhất
+            }
+            if (wp == null) continue;
+            points.push({ x: xs(i), y: ys(wp), i });
+        }
+
+        if (!hasData) {
+            svg.innerHTML = '';
+            empty.style.display = 'block';
+            return;
+        }
+        empty.style.display = 'none';
+        this._chartGeo = { xMin, xMax, N, yMin, yMax, xs };
+
+        let d = '';
+        let white = 'M' + points[0].x.toFixed(1) + ' ' + points[0].y.toFixed(1);
+        let black = 'M' + points[0].x.toFixed(1) + ' ' + points[0].y.toFixed(1);
+        for (let k = 1; k < points.length; k++) {
+            d += 'L' + points[k].x.toFixed(1) + ' ' + points[k].y.toFixed(1) + ' ';
+            white += 'L' + points[k].x.toFixed(1) + ' ' + points[k].y.toFixed(1);
+            black += 'L' + points[k].x.toFixed(1) + ' ' + points[k].y.toFixed(1);
+        }
+        const p0 = points[0], pn = points[points.length - 1];
+        white += ' L' + pn.x.toFixed(1) + ' ' + yMin + ' L' + p0.x.toFixed(1) + ' ' + yMin + ' Z';
+        black += ' L' + pn.x.toFixed(1) + ' ' + yMax + ' L' + p0.x.toFixed(1) + ' ' + yMax + ' Z';
+
+        let html = '';
+        // vùng trắng / đen
+        html += '<path d="' + white + '" fill="rgba(240,240,240,0.16)"></path>';
+        html += '<path d="' + black + '" fill="rgba(0,0,0,0.30)"></path>';
+        // đường giữa 50%
+        html += '<line x1="' + xMin + '" y1="' + ys(50).toFixed(1) + '" x2="' + xMax + '" y2="' + ys(50).toFixed(1) + '" stroke="rgba(128,128,128,0.45)" stroke-width="1" stroke-dasharray="4 3"></line>';
+        // nhãn trục y
+        html += '<text x="6" y="' + (ys(100) + 4) + '" class="chart-tick">100%</text>';
+        html += '<text x="6" y="' + (ys(50) + 4) + '" class="chart-tick">50%</text>';
+        html += '<text x="6" y="' + (ys(0) + 4) + '" class="chart-tick">0%</text>';
+        // đường eval
+        html += '<path d="M' + points[0].x.toFixed(1) + ' ' + points[0].y.toFixed(1) + ' ' + d + '" fill="none" stroke="#aab" stroke-width="1.8" stroke-linejoin="round"></path>';
+        // số nước ở trục x (mỗi 5 ply)
+        const step = N <= 0 ? 1 : Math.max(1, Math.ceil(N / 6));
+        for (let i = 0; i <= N; i += step) {
+            html += '<text x="' + xs(i).toFixed(1) + '" y="' + (H - 4) + '" class="chart-tick" text-anchor="middle">' + i + '</text>';
+        }
+        // vùng bắt click
+        html += '<rect x="' + xMin + '" y="' + yMin + '" width="' + (xMax - xMin) + '" height="' + (yMax - yMin) + '" fill="transparent" class="chart-hit"></rect>';
+        svg.innerHTML = html;
     },
 
     exportPgn() {
