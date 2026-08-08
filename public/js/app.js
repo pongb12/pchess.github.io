@@ -358,6 +358,7 @@ class PChessGame {
         this.validMoves = [];
         this.dragFrom = null;
         this.lastMove = null;
+        this.lastMoveInfo = null; // { san, captured, color, isCastle, isPromotion, isCheck } — cho indicators
         this.gameActive = false;
         this.moveHistory = [];
         this.capturedPieces = { w: [], b: [] };
@@ -369,13 +370,27 @@ class PChessGame {
         this.lastMoveTime = 0;
         this.reconnectAttempts = 0;
         this.pendingPromotion = null;
-        this.rematchState = { requested: false, by: null };
+        this.rematchState = { requested: false, by: null, status: 'idle', acceptedBy: [] };
         this.gameResult = null;
         this.recoveringSync = false;
+        // Flip board (cho phép xem từ góc nhìn đối thủ — chủ yếu cho analysis
+        // mode sau ván, nhưng cũng dùng được trong game nếu người chơi muốn).
+        this.boardFlipped = false;
+        // Move preview khi rê quân: ghost piece ở ô đích
+        this.previewSquare = null;
+        // Sync banner timer (tự ẩn sau vài giây)
+        this.syncBannerTimer = null;
+        // Conn banner timer
+        this.connBannerTimer = null;
+        // Reconnect reason rõ ràng: 'temp_disconnect' | 'room_full' | 'takeover' | 'peer_left' | null
+        this.disconnectReason = null;
+        // Active mobile panel tab
+        this.activePanelTab = 'move-history';
 
         // Bind methods
         this.handleSquareClick = this.handleSquareClick.bind(this);
         this.handleResize = this.handleResize.bind(this);
+        this.handleKeyDown = this.handleKeyDown.bind(this);
 
         this.init();
     }
@@ -387,6 +402,8 @@ class PChessGame {
         this.checkUrlForRoom();
         window.addEventListener('resize', this.handleResize);
         window.addEventListener('beforeunload', () => this.cleanup());
+        // Keyboard shortcuts toàn cục (chỉ hoạt động khi đang ở game/analysis)
+        window.addEventListener('keydown', this.handleKeyDown);
     }
 
     bindEvents() {
@@ -523,6 +540,17 @@ class PChessGame {
             this.exportPgn();
         });
 
+        // Flip board
+        const flipBtn = document.getElementById('btn-flip-board');
+        if (flipBtn) flipBtn.addEventListener('click', () => this.flipBoard());
+
+        // Mobile panel tabs
+        document.querySelectorAll('.panel-tab[data-tab]').forEach(btn => {
+            btn.addEventListener('click', (e) => this.switchPanelTab(e.target.dataset.tab));
+        });
+        const collapseBtn = document.getElementById('panel-tab-collapse');
+        if (collapseBtn) collapseBtn.addEventListener('click', () => this.togglePanelCollapse());
+
         // Sync settings UI
         this.syncSettingsUI();
     }
@@ -652,9 +680,17 @@ class PChessGame {
                     this.startHeartbeat();
                     if (wasReconnect) {
                         this.recoveringSync = true;
-                        showToast('Da ket noi lai, dang dong bo van co...', 'info');
+                        // Hiển thị sync banner thay vì chỉ toast text nhỏ
+                        this.showSyncBanner('Đang khôi phục ván cờ...');
+                        // Auto-sync ngay khi WS mở lại. Server sẽ tự gửi sync message
+                        // (xem handleJoined + handleSync) nên ta chỉ cần đợi. Vẫn gửi
+                        // sync_request để phòng trường hợp server không có game.
                         this.sendMessage({ type: 'sync_request' });
+                        // Backup: nếu sau 4s chưa nhận sync thì vẫn clear banner
+                        if (this.syncBannerTimer) clearTimeout(this.syncBannerTimer);
+                        this.syncBannerTimer = setTimeout(() => this.hideSyncBanner(), 4000);
                     }
+                    this.updateConnDetail();
                     resolve(roomCode);
                 };
 
@@ -700,28 +736,31 @@ class PChessGame {
 
         if (!this.ws) return; // đóng chủ động (leaveRoom / cleanup)
 
-        const statusDot = document.querySelector('.status-dot');
-        if (statusDot) {
-            statusDot.classList.remove('connected');
-            statusDot.classList.add('disconnected');
-        }
-        const connText = document.getElementById('connection-text');
-        if (connText) connText.textContent = 'Mất kết nối';
+        // Phân biệt rõ 4 lý do mất kết nối để hiển thị đúng UX:
+        //   1. temp_disconnect — mạng rớt tạm thời, đang thử reconnect
+        //   2. room_full — phòng đầy, thử lại vài lần rồi fallback
+        //   3. takeover — phiên bị thay thế (xem handleSessionTakeover)
+        //   4. peer_left — đối thủ rời phòng (server báo, không phải WS close)
+        // handleSessionTakeover sẽ tự set disconnectReason='takeover' và không vào đây.
+        this.disconnectReason = 'temp_disconnect';
+
+        this.setConnState('disconnected', 'Mất kết nối', 'Đang thử kết nối lại...');
 
         if (this.gameActive && this.reconnectAttempts < 5) {
-            showToast('Mất kết nối, đang thử kết nối lại...', 'warning');
+            this.showConnBanner('temp_disconnect', 'Mất kết nối mạng', 'Đang thử kết nối lại (lần ' + (this.reconnectAttempts + 1) + '/5)...');
             this.reconnectAttempts++;
             this.scheduleReconnect();
         } else if (this.gameActive) {
-            showToast('Không thể kết nối lại. Vui lòng tạo phòng mới.', 'error');
+            this.showConnBanner('temp_disconnect', 'Không thể kết nối lại', 'Vui lòng tạo phòng mới.');
             this.leaveRoom();
         } else {
             // Chưa vào ván mà mất kết nối: thường do CONFIG.WS_URL chưa đổi / chưa deploy worker
-            showToast('Không kết nối được server. Kiểm tra CONFIG.WS_URL và deploy worker (xem README).', 'error');
+            this.showConnBanner('temp_disconnect', 'Không kết nối được server', 'Kiểm tra CONFIG.WS_URL và deploy worker.');
             this.cleanup();
             this.showPage('lobby-page', false);
             this.showPage('landing-page', true);
         }
+        this.updateConnDetail();
     }
 
     scheduleReconnect() {
@@ -913,7 +952,7 @@ class PChessGame {
                 this.handlePeerJoined();
                 break;
             case 'peer_left':
-                this.handlePeerLeft();
+                this.handlePeerLeft(msg);
                 break;
             case 'move':
                 this.handleRemoteMove(msg);
@@ -927,6 +966,9 @@ class PChessGame {
             case 'session-takeover':
                 this.handleSessionTakeover();
                 break;
+            case 'sync_banner':
+                this.handleSyncBanner(msg);
+                break;
             case 'sync':
                 this.handleSync(msg);
                 break;
@@ -934,13 +976,19 @@ class PChessGame {
                 this.requestSync();
                 break;
             case 'rematch_request':
-                this.handleRematchRequest();
+                this.handleRematchRequest(msg);
                 break;
             case 'rematch_accept':
-                this.handleRematchAccept();
+                this.handleRematchAccept(msg);
+                break;
+            case 'rematch_accept_partial':
+                this.handleRematchAcceptPartial(msg);
                 break;
             case 'rematch_decline':
-                this.handleRematchDecline();
+                this.handleRematchDecline(msg);
+                break;
+            case 'cheat_flagged':
+                this.handleCheatFlagged(msg);
                 break;
             case 'resign':
                 this.handleResign();
@@ -966,6 +1014,7 @@ class PChessGame {
             case 'pong':
                 if (msg.timestamp) {
                     this.lastPing = Date.now() - msg.timestamp;
+                    this.updateConnDetail();
                 }
                 break;
         }
@@ -979,16 +1028,20 @@ class PChessGame {
             this.isHost = msg.role === 'host';
         }
 
-        const statusDot = document.querySelector('.status-dot');
-        if (statusDot) {
-            statusDot.classList.add('connected');
-            statusDot.classList.remove('disconnected');
-        }
-        const connText = document.getElementById('connection-text');
-        if (connText) {
-            connText.textContent = (this.isHost && !msg.game) ? 'Đang chờ đối thủ...' : 'Đã kết nối!';
+        // Server gửi kèm trạng thái rematch hiện tại (nếu có) — đồng bộ ngay
+        if (msg.rematch) {
+            this.rematchState = {
+                requested: msg.rematch.status !== 'idle' && msg.rematch.status !== 'declined' && msg.rematch.status !== 'accepted_by_both',
+                by: msg.rematch.requestedBy,
+                status: msg.rematch.status,
+                acceptedBy: msg.rematch.acceptedBy || []
+            };
         }
 
+        this.setConnState('connected', (this.isHost && !msg.game) ? 'Đang chờ đối thủ' : 'Đã kết nối');
+
+        // Auto-sync: nếu server gửi game state sẵn (reconnect), không cần toast
+        // thêm "đã nối lại ván cờ đang dở" nữa vì đã có sync banner xử lý.
         if (msg.game && msg.game.fen) {
             // Nối lại ván cờ đang dở (trạng thái server là nguồn sự thật)
             this.chess.load(msg.game.fen);
@@ -1006,21 +1059,27 @@ class PChessGame {
             this.updateCapturedPieces();
             this.updateTimerDisplay();
             this.startTimer();
-            showToast('Đã nối lại ván cờ đang dở', 'info');
+            // Tính lastMoveInfo từ history cuối
+            this.recomputeLastMoveInfo();
+            this.updateMoveIndicators();
+            // Nếu reconnect, server đã gửi sync_banner + sync message riêng
+            if (msg.reconnect) {
+                this.showSyncBanner('Đang khôi phục ván cờ...');
+                // Backup: clear sau 3s nếu không nhận được sync
+                if (this.syncBannerTimer) clearTimeout(this.syncBannerTimer);
+                this.syncBannerTimer = setTimeout(() => this.hideSyncBanner(), 3000);
+            } else {
+                showToast('Đã nối lại ván cờ đang dở', 'info');
+            }
         } else if (this.isHost && this.gameActive) {
             this.requestSync();
         }
+        this.updateConnDetail();
     }
 
     handlePeerJoined() {
         debugLog('info', 'Đối thủ đã vào phòng');
-        const statusDot = document.querySelector('.status-dot');
-        if (statusDot) {
-            statusDot.classList.add('connected');
-            statusDot.classList.remove('disconnected');
-        }
-        const connText = document.getElementById('connection-text');
-        if (connText) connText.textContent = 'Đã kết nối!';
+        this.setConnState('connected', 'Đã kết nối');
 
         if (!this.isHost) {
             showToast('Đối thủ đã kết nối lại!', 'success');
@@ -1041,22 +1100,22 @@ class PChessGame {
                 this.startGame();
             }
         }
+        this.updateConnDetail();
     }
 
-    handlePeerLeft() {
-        debugLog('warn', 'Đối thủ đã rời phòng');
-        const statusDot = document.querySelector('.status-dot');
-        if (statusDot) {
-            statusDot.classList.remove('connected');
-            statusDot.classList.add('disconnected');
-        }
-        const connText = document.getElementById('connection-text');
-        if (connText) connText.textContent = 'Mất kết nối';
+    handlePeerLeft(msg) {
+        debugLog('warn', 'Đối thủ đã rời phòng', msg && msg.reason);
+        // Server phân biệt rõ: 'disconnect' (đối thủ rời phòng, có thể do mất mạng).
+        // Đây là trạng thái peer_left — khác với temp_disconnect (chính mình rớt mạng).
+        this.disconnectReason = 'peer_left';
+        this.setConnState('peer_left', 'Đối thủ đã rời phòng');
 
         if (this.gameActive) {
-            showToast('Đối thủ đã ngắt kết nối', 'error');
+            this.showConnBanner('peer_left', 'Đối thủ đã ngắt kết nối',
+                'Ván cờ được giữ nguyên. Bạn có thể chờ đối thủ vào lại.');
             this.stopTimer();
         }
+        this.updateConnDetail();
     }
 
     handleMoveRejected(msg) {
@@ -1066,13 +1125,14 @@ class PChessGame {
     }
 
     handleRoomFull() {
-        // Nếu đang nối lại (hoặc đã có phiên phòng trong sessionStorage), đừng
-        // xoá session: socket cũ chưa được server dọn nên phòng "tạm đầy".
-        // Thử lại vài lần, server sẽ dọn slot cũ rồi cho vào.
+        // Phòng đầy: thử lại vài lần (server có thể đang dọn socket cũ).
+        this.disconnectReason = 'room_full';
+        this.setConnState('room_full', 'Phòng đang đầy');
         const hasSession = !!(this.roomId && this.role) || !!sessionStorage.getItem('pchess_room');
         if (hasSession && this.reconnectAttempts < 8) {
             this.reconnectAttempts++;
-            showToast('Phòng đang đầy, thử kết nối lại (' + this.reconnectAttempts + '/8)...', 'warning');
+            this.showConnBanner('room_full', 'Phòng đang đầy',
+                'Thử kết nối lại (' + this.reconnectAttempts + '/8)...');
             if (this.ws) {
                 this.ws.onclose = null;
                 try {
@@ -1084,11 +1144,12 @@ class PChessGame {
             return;
         }
 
-        showToast('Phòng đã đầy! (tối đa 2 người)', 'error');
+        this.showConnBanner('room_full', 'Phòng đã đầy', 'Tối đa 2 người. Vui lòng tạo phòng mới.');
         this.cleanup();
         this.showPage('lobby-page', false);
         this.showPage('landing-page', true);
         sessionStorage.removeItem('pchess_room');
+        this.updateConnDetail();
     }
 
     handleSessionTakeover() {
@@ -1096,7 +1157,10 @@ class PChessGame {
         // người dùng mở lại trang sau khi mất mạng). Dừng ván và thoát gọn,
         // không tự reconnect vì socket mới đã nắm vai trò này.
         debugLog('warn', 'Phiên bị thay thế (session-takeover)');
-        showToast('Phiên này đã được mở ở nơi khác', 'warning');
+        this.disconnectReason = 'takeover';
+        this.setConnState('takeover', 'Phiên bị thay thế');
+        this.showConnBanner('takeover', 'Phiên đã được mở ở nơi khác',
+            'Tab này sẽ tự tắt để tránh xung đột.');
         if (this.ws) {
             this.ws.onclose = null;
             try {
@@ -1111,6 +1175,7 @@ class PChessGame {
         this.showPage('lobby-page', false);
         this.showPage('landing-page', true);
         sessionStorage.removeItem('pchess_room');
+        this.updateConnDetail();
     }
 
     handleInit(msg) {
@@ -1158,6 +1223,17 @@ class PChessGame {
 
         // Move is valid, update UI
         this.lastMove = { from: msg.move.from, to: msg.move.to };
+        // Track move info chi tiết cho indicators (last move / check / capture / promotion)
+        this.lastMoveInfo = {
+            san: result.san,
+            from: msg.move.from,
+            to: msg.move.to,
+            color: result.color,
+            captured: result.captured || null,
+            isCastle: result.flags.includes('k') || result.flags.includes('q'),
+            isPromotion: !!result.promotion,
+            isCheck: false // set bên dưới sau khi kiểm tra
+        };
         this.moveHistory.push(result.san);
 
         const opponentColor = this.myColor === 'w' ? 'b' : 'w';
@@ -1185,7 +1261,11 @@ class PChessGame {
         // Check for check/checkmate
         if (this.chess.in_check()) {
             this.soundManager.play('check');
+            if (this.lastMoveInfo) this.lastMoveInfo.isCheck = true;
         }
+
+        // Cập nhật indicators (last move / check / capture / promotion pending)
+        this.updateMoveIndicators();
 
         if (this.chess.game_over()) {
             this.handleGameOver();
@@ -1193,9 +1273,12 @@ class PChessGame {
     }
 
     handleSync(msg) {
-        if (this.recoveringSync) {
+        // Auto-sync khi WS mở lại: server gửi sync có source='reconnect' hoặc 'request'.
+        // Clear sync banner khi nhận được.
+        if (this.recoveringSync || msg.source === 'reconnect') {
             this.recoveringSync = false;
-            showToast('Dong bo xong, van co da san sang', 'success');
+            this.hideSyncBanner();
+            this.setConnState('connected', 'Đã đồng bộ');
         }
         if (msg.fen && msg.fen !== this.chess.fen()) {
             this.chess.load(msg.fen);
@@ -1210,6 +1293,8 @@ class PChessGame {
             this.updateMoveList();
             this.updateCapturedPieces();
             this.updateGameStatus();
+            this.recomputeLastMoveInfo();
+            this.updateMoveIndicators();
 
             if (msg.timers) {
                 this.timers = msg.timers;
@@ -1217,7 +1302,40 @@ class PChessGame {
                 this.startTimer();
             }
 
-            showToast('Đã đồng bộ trạng thái game', 'info');
+            if (msg.source !== 'reconnect') {
+                showToast('Đã đồng bộ trạng thái game', 'info');
+            }
+        } else {
+            // FEN giống nhau — vẫn clear banner nếu đang recovering
+            if (this.recoveringSync) {
+                this.hideSyncBanner();
+                this.recoveringSync = false;
+            }
+        }
+        this.updateConnDetail();
+    }
+
+    handleSyncBanner(msg) {
+        // Server chủ động báo "đang khôi phục" — hiển thị banner.
+        if (msg.state === 'restoring') {
+            this.showSyncBanner('Đang khôi phục ván cờ từ server...');
+        }
+    }
+
+    handleCheatFlagged(msg) {
+        // Anti-cheat heuristic đã flag một player. Đây là audit-only, không
+        // chặn realtime — chỉ hiển thị badge nhỏ để người chơi biết ván đang
+        // được theo dõi.
+        debugLog('warn', 'Cheat flag từ server:', msg);
+        const isMe = msg.role === this.role;
+        const reasonText = {
+            fast_move_streak: 'chuỗi nước đi quá nhanh',
+            uniform_move_timing: 'nhịp nước đi quá đều'
+        }[msg.reason] || msg.reason;
+        if (isMe) {
+            showToast('Hệ thống phát hiện nhịp đi bất thường (' + reasonText + '). Ván đang được xem xét.', 'warning', 5000);
+        } else {
+            showToast('Đối thủ có dấu hiệu bất thường (' + reasonText + '). Ván đang được xem xét.', 'warning', 5000);
         }
     }
 
@@ -1290,9 +1408,13 @@ class PChessGame {
         const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
         const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
 
-        // Determine orientation based on color
-        const displayFiles = this.myColor === 'w' ? files : [...files].reverse();
-        const displayRanks = this.myColor === 'w' ? ranks : [...ranks].reverse();
+        // Determine orientation based on color + flip flag.
+        // Mặc định xem từ góc nhìn myColor. Khi boardFlipped = true, lật 180 độ
+        // để xem từ góc nhìn đối thủ (hữu ích khi phân tích sau ván).
+        const baseFiles = this.myColor === 'w' ? files : [...files].reverse();
+        const baseRanks = this.myColor === 'w' ? ranks : [...ranks].reverse();
+        const displayFiles = this.boardFlipped ? [...baseFiles].reverse() : baseFiles;
+        const displayRanks = this.boardFlipped ? [...baseRanks].reverse() : baseRanks;
 
         for (let r = 0; r < 8; r++) {
             for (let f = 0; f < 8; f++) {
@@ -1324,10 +1446,18 @@ class PChessGame {
                             this.validMoves = this.getValidMoves(squareName);
                             e.dataTransfer.effectAllowed = 'move';
                             e.dataTransfer.setData('text/plain', squareName);
+                            // Drag image ghost = piece itself (mặc định đã OK)
+                            this.renderBoard(); // hiển thị ô hợp lệ ngay khi bắt đầu drag
                         });
                         pieceEl.addEventListener('dragend', () => {
                             this.dragFrom = null;
+                            this.previewSquare = null;
                             this.clearSelection();
+                        });
+                        // Move preview khi rê chuột trên bàn cờ (hover ghost)
+                        pieceEl.addEventListener('mouseenter', () => {
+                            if (!this.gameActive) return;
+                            // Không can thiệp khi đang drag (trình duyệt tự vẽ)
                         });
                     }
 
@@ -1360,13 +1490,28 @@ class PChessGame {
                     }
                 }
 
-                // Valid moves highlight
+                // Valid moves highlight — rõ hơn trên mobile (chấm tròn lớn + viền đỏ khi ăn)
                 if (this.validMoves.includes(squareName)) {
                     const targetPiece = this.chess.get(squareName);
                     if (targetPiece && targetPiece.color !== this.myColor) {
                         square.classList.add('valid-capture');
                     } else {
                         square.classList.add('valid-move');
+                    }
+                }
+
+                // Move preview (ghost) khi rê chuột và đang có ô đích hợp lệ
+                if (this.dragFrom && this.previewSquare === squareName && this.validMoves.includes(squareName)) {
+                    square.classList.add('preview-target');
+                    // Ghost piece nhỏ ở ô đích
+                    const piece = this.chess.get(this.dragFrom);
+                    if (piece) {
+                        const ghost = document.createElement('img');
+                        ghost.className = 'piece piece-ghost';
+                        ghost.src = getPieceUrl(piece.color, piece.type);
+                        ghost.alt = '';
+                        ghost.style.opacity = '0.5';
+                        square.appendChild(ghost);
                     }
                 }
 
@@ -1380,7 +1525,21 @@ class PChessGame {
 
                 square.addEventListener('click', () => this.handleSquareClick(squareName));
                 square.addEventListener('dragover', (e) => {
-                    if (this.dragFrom) e.preventDefault();
+                    if (this.dragFrom) {
+                        e.preventDefault();
+                        // Cập nhật preview khi hover
+                        if (this.previewSquare !== squareName) {
+                            this.previewSquare = squareName;
+                            // Chỉ re-render partial (update ghost) — nhưng vì board
+                            // nhỏ, re-render cả board vẫn OK về perf.
+                            this.renderBoard();
+                        }
+                    }
+                });
+                square.addEventListener('dragleave', () => {
+                    if (this.previewSquare === squareName) {
+                        this.previewSquare = null;
+                    }
                 });
                 square.addEventListener('drop', (e) => {
                     e.preventDefault();
@@ -1391,6 +1550,7 @@ class PChessGame {
                         this.clearSelection();
                     }
                     this.dragFrom = null;
+                    this.previewSquare = null;
                 });
                 board.appendChild(square);
             }
@@ -1554,18 +1714,29 @@ class PChessGame {
     // ===== Game Status & Timer =====
     updateGameStatus() {
         const statusEl = document.getElementById('game-status');
+        if (!statusEl) return;
         const indicator = statusEl.querySelector('.status-indicator');
         const text = statusEl.querySelector('.status-text');
 
         if (this.gameResult || this.chess.game_over()) {
             text.textContent = 'Kết thúc';
-            indicator.className = 'status-indicator';
+            indicator.className = 'status-indicator ended';
+            statusEl.dataset.state = 'ended';
             return;
         }
 
         if (!this.gameActive) {
             text.textContent = 'Chưa bắt đầu';
-            indicator.className = 'status-indicator';
+            indicator.className = 'status-indicator idle';
+            statusEl.dataset.state = 'idle';
+            return;
+        }
+
+        // Nếu WS chưa mở / đang reconnect -> ưu tiên hiển thị trạng thái kết nối
+        if (!this.wsOpen) {
+            text.textContent = '⚠ Mất kết nối — đang chờ đồng bộ';
+            indicator.className = 'status-indicator disconnected';
+            statusEl.dataset.state = 'disconnected';
             return;
         }
 
@@ -1575,12 +1746,15 @@ class PChessGame {
         if (inCheck) {
             text.textContent = myTurn ? '⚠️ Bạn đang bị chiếu!' : 'Đối thủ đang bị chiếu';
             indicator.className = 'status-indicator check';
+            statusEl.dataset.state = myTurn ? 'my-check' : 'opp-check';
         } else if (myTurn) {
             text.textContent = '🎯 Đến lượt bạn';
             indicator.className = 'status-indicator your-turn';
+            statusEl.dataset.state = 'your-turn';
         } else {
             text.textContent = '⏳ Đang chờ đối thủ...';
             indicator.className = 'status-indicator opponent-turn';
+            statusEl.dataset.state = 'opponent-turn';
         }
     }
 
@@ -1792,16 +1966,22 @@ class PChessGame {
         ta.remove();
     }
 
-    // ===== Rematch =====
+    // ===== Rematch (state machine client-side matching server) =====
     requestRematch() {
         document.getElementById('gameover-modal').classList.add('hidden');
-        this.rematchState = { requested: true, by: this.role };
+        this.rematchState = { requested: true, by: this.role, status: 'requested', acceptedBy: [this.role] };
         this.sendMessage({ type: 'rematch_request' });
-        showToast('Đã gửi yêu cầu chơi lại', 'info');
+        showToast('Đã gửi yêu cầu chơi lại. Chờ đối thủ đồng ý.', 'info');
     }
 
-    handleRematchRequest() {
-        this.rematchState = { requested: true, by: 'opponent' };
+    handleRematchRequest(msg) {
+        // Đối thủ yêu cầu chơi lại. Server gửi kèm `by` để biết ai yêu cầu.
+        this.rematchState = {
+            requested: true,
+            by: msg.by || 'opponent',
+            status: 'requested',
+            acceptedBy: [msg.by]
+        };
         document.getElementById('rematch-modal').classList.remove('hidden');
         this.soundManager.play('notify');
     }
@@ -1809,24 +1989,48 @@ class PChessGame {
     acceptRematch() {
         document.getElementById('rematch-modal').classList.add('hidden');
         this.sendMessage({ type: 'rematch_accept' });
+        // KHÔNG resetGame() ngay — đợi server confirm 'rematch_accept' (broadcast
+        // khi cả hai đã accept). Trước đây client tự reset ngay khi nhận 1
+        // accept, dẫn đến state lệch nếu message đến không đúng thứ tự.
+        showToast('Đã đồng ý chơi lại. Chờ đối thủ xác nhận...', 'info');
+    }
+
+    handleRematchAcceptPartial(msg) {
+        // Server báo: đối thủ đã accept nhưng bản thân chưa (hoặc ngược lại).
+        // Hiển thị tiến trình để người chơi biết đang chờ ai.
+        const acceptedBy = msg.acceptedBy || (msg.by ? [msg.by] : []);
+        this.rematchState.status = msg.status || 'requested';
+        this.rematchState.acceptedBy = acceptedBy;
+        const me = this.role;
+        const them = this.role === 'host' ? 'guest' : 'host';
+        const meAccepted = acceptedBy.includes(me);
+        const themAccepted = acceptedBy.includes(them);
+        if (meAccepted && !themAccepted) {
+            showToast('Bạn đã đồng ý. Đang chờ đối thủ...', 'info');
+        } else if (themAccepted && !meAccepted) {
+            // Đối thủ đã đồng ý trước — popup hỏi lại để mình bấm accept.
+            document.getElementById('rematch-modal').classList.remove('hidden');
+            showToast('Đối thủ muốn chơi lại. Hãy xác nhận.', 'info');
+        }
+    }
+
+    handleRematchAccept(msg) {
+        // Server broadcast 'rematch_accept' khi CẢ HAI đã đồng ý -> reset game.
         this.resetGame();
+        showToast('Đối thủ đồng ý chơi lại!', 'success');
+    }
+
+    handleRematchDecline(msg) {
+        this.rematchState = { requested: false, by: null, status: 'idle', acceptedBy: [] };
+        document.getElementById('rematch-modal').classList.add('hidden');
+        showToast('Đối thủ từ chối chơi lại', 'warning');
     }
 
     declineRematch() {
         document.getElementById('rematch-modal').classList.add('hidden');
         this.sendMessage({ type: 'rematch_decline' });
-        this.rematchState = { requested: false, by: null };
+        this.rematchState = { requested: false, by: null, status: 'idle', acceptedBy: [] };
         showToast('Đã từ chối chơi lại', 'info');
-    }
-
-    handleRematchAccept() {
-        this.resetGame();
-        showToast('Đối thủ đồng ý chơi lại!', 'success');
-    }
-
-    handleRematchDecline() {
-        this.rematchState = { requested: false, by: null };
-        showToast('Đối thủ từ chối chơi lại', 'warning');
     }
 
     resetGame() {
@@ -1838,11 +2042,12 @@ class PChessGame {
         this.moveHistory = [];
         this.capturedPieces = { w: [], b: [] };
         this.lastMove = null;
+        this.lastMoveInfo = null;
         this.selectedSquare = null;
         this.validMoves = [];
         this.currentTurn = 'w';
         this.gameResult = null;
-        this.rematchState = { requested: false, by: null };
+        this.rematchState = { requested: false, by: null, status: 'idle', acceptedBy: [] };
         this.pendingPromotion = null;
 
         // Reset timer
@@ -1862,6 +2067,7 @@ class PChessGame {
         this.updateMoveList();
         this.updateCapturedPieces();
         this.updateTimerDisplay();
+        this.updateMoveIndicators();
 
         // Start timer for the side to move (both players run clocks locally)
         this.startTimer();
@@ -2081,7 +2287,276 @@ class PChessGame {
     }
 
     handleResize() {
-        // Responsive adjustments if needed
+        // Responsive adjustments:
+        // - Trên mobile (< 768px), panel sẽ tự chuyển sang dạng slide-up.
+        // - Ẩn các tab không cần thiết để tiết kiệm không gian.
+        // - Không cần làm gì thêm vì CSS đã xử lý phần lớn qua media queries.
+        // Chỉ log để debug.
+        if (window.innerWidth < 768) {
+            debugLog('info', 'Mobile layout active, innerWidth =', window.innerWidth);
+        }
+    }
+
+    // ===== Sync / Connection Banner =====
+    showSyncBanner(text) {
+        const banner = document.getElementById('sync-banner');
+        if (!banner) return;
+        const textEl = banner.querySelector('.sync-text');
+        if (textEl) textEl.textContent = text || 'Đang khôi phục ván cờ...';
+        banner.classList.remove('hidden');
+        // Force reflow để animation chạy
+        void banner.offsetWidth;
+        banner.classList.add('visible');
+    }
+
+    hideSyncBanner() {
+        const banner = document.getElementById('sync-banner');
+        if (!banner) return;
+        banner.classList.remove('visible');
+        // Đợi animation kết thúc rồi mới ẩn hẳn
+        setTimeout(() => {
+            if (!banner.classList.contains('visible')) {
+                banner.classList.add('hidden');
+            }
+        }, 300);
+        if (this.syncBannerTimer) {
+            clearTimeout(this.syncBannerTimer);
+            this.syncBannerTimer = null;
+        }
+    }
+
+    // Connection banner: hiển thị lý do mất kết nối rõ ràng (temp/room_full/takeover/peer_left)
+    showConnBanner(reason, title, detail) {
+        const banner = document.getElementById('conn-banner');
+        if (!banner) return;
+        banner.className = 'conn-banner visible ' + reason;
+        const textEl = banner.querySelector('.conn-text');
+        const detailEl = banner.querySelector('.conn-detail');
+        if (textEl) textEl.textContent = title || '';
+        if (detailEl) detailEl.textContent = detail || '';
+        banner.classList.remove('hidden');
+        // Tự ẩn sau 6s nếu không phải trạng thái cuối (takeover thì giữ lâu hơn)
+        if (this.connBannerTimer) clearTimeout(this.connBannerTimer);
+        const timeout = reason === 'takeover' ? 10000 : 6000;
+        this.connBannerTimer = setTimeout(() => {
+            // Chỉ ẩn nếu trạng thái hiện tại đã resolved
+            if (this.wsOpen || reason === 'takeover') {
+                banner.classList.remove('visible');
+                setTimeout(() => banner.classList.add('hidden'), 300);
+            }
+        }, timeout);
+    }
+
+    hideConnBanner() {
+        const banner = document.getElementById('conn-banner');
+        if (!banner) return;
+        banner.classList.remove('visible');
+        setTimeout(() => banner.classList.add('hidden'), 300);
+        if (this.connBannerTimer) {
+            clearTimeout(this.connBannerTimer);
+            this.connBannerTimer = null;
+        }
+    }
+
+    // Connection state setter — cập nhật cả status dot + text + detail list
+    setConnState(state, text) {
+        const dot = document.querySelector('.status-dot');
+        if (dot) {
+            dot.classList.remove('connected', 'disconnected', 'peer_left', 'room_full', 'takeover');
+            if (state === 'connected') dot.classList.add('connected');
+            else if (state === 'disconnected') dot.classList.add('disconnected');
+            else if (state === 'peer_left') dot.classList.add('peer_left');
+            else if (state === 'room_full') dot.classList.add('room_full');
+            else if (state === 'takeover') dot.classList.add('takeover');
+        }
+        const badge = document.querySelector('#connection-badge .badge-text');
+        if (badge) {
+            badge.textContent = ({
+                connected: 'Đã kết nối',
+                disconnected: 'Mất kết nối',
+                peer_left: 'Đối thủ rời phòng',
+                room_full: 'Phòng đầy',
+                takeover: 'Phiên bị thay thế'
+            })[state] || 'Server';
+        }
+        const connText = document.getElementById('connection-text');
+        if (connText && text) connText.textContent = text;
+
+        // Ẩn conn banner khi đã kết nối lại
+        if (state === 'connected') this.hideConnBanner();
+
+        // Cập nhật detail list
+        const detailState = document.getElementById('conn-detail-state');
+        if (detailState && text) detailState.textContent = text;
+
+        // Cập nhật game status (nếu mất kết nối, hiển thị rõ trên header)
+        this.updateGameStatus();
+    }
+
+    updateConnDetail() {
+        const pingEl = document.getElementById('conn-detail-ping');
+        if (pingEl) pingEl.textContent = this.lastPing != null ? (this.lastPing + ' ms') : '—';
+        const roomEl = document.getElementById('conn-detail-room');
+        if (roomEl) roomEl.textContent = this.roomId || '—';
+        const roleEl = document.getElementById('conn-detail-role');
+        if (roleEl) roleEl.textContent = this.role ? (this.role === 'host' ? 'Host (Trắng)' : 'Guest (Đen)') : '—';
+    }
+
+    // ===== Move Indicators (last move / check / capture / promotion pending) =====
+    recomputeLastMoveInfo() {
+        // Khi sync từ server, không có event "move" riêng — phải tính lại
+        // lastMoveInfo từ history cuối cùng.
+        if (!this.moveHistory.length) {
+            this.lastMoveInfo = null;
+            return;
+        }
+        try {
+            const ch = new Chess();
+            for (const san of this.moveHistory) ch.move(san);
+            const verbose = ch.history({ verbose: true });
+            const last = verbose[verbose.length - 1];
+            if (!last) { this.lastMoveInfo = null; return; }
+            this.lastMoveInfo = {
+                san: last.san,
+                from: last.from,
+                to: last.to,
+                color: last.color,
+                captured: last.captured || null,
+                isCastle: last.flags.includes('k') || last.flags.includes('q'),
+                isPromotion: !!last.promotion,
+                isCheck: ch.in_check()
+            };
+        } catch (e) {
+            this.lastMoveInfo = null;
+        }
+    }
+
+    updateMoveIndicators() {
+        const lastEl = document.getElementById('mi-last');
+        const checkEl = document.getElementById('mi-check');
+        const captureEl = document.getElementById('mi-capture');
+        const promoEl = document.getElementById('mi-promotion');
+        if (!lastEl) return;
+
+        // Last move
+        const lastVal = lastEl.querySelector('.mi-value');
+        if (this.lastMoveInfo && this.lastMoveInfo.san) {
+            if (lastVal) lastVal.textContent = this.lastMoveInfo.san;
+            lastEl.classList.remove('hidden');
+        } else {
+            if (lastVal) lastVal.textContent = '—';
+        }
+
+        // Check indicator
+        const inCheck = this.chess.in_check && this.chess.in_check();
+        if (checkEl) checkEl.classList.toggle('hidden', !inCheck);
+
+        // Capture indicator (chỉ hiển thị khi nước vừa đi có ăn quân)
+        if (captureEl) captureEl.classList.toggle('hidden', !(this.lastMoveInfo && this.lastMoveInfo.captured));
+
+        // Promotion pending indicator
+        if (promoEl) promoEl.classList.toggle('hidden', !this.pendingPromotion);
+    }
+
+    // ===== Flip board =====
+    flipBoard() {
+        this.boardFlipped = !this.boardFlipped;
+        this.renderBoard();
+        showToast(this.boardFlipped ? 'Đã lật bàn cờ' : 'Đã trở lại góc nhìn mặc định', 'info', 1500);
+    }
+
+    // ===== Mobile panel tabs =====
+    switchPanelTab(tab) {
+        this.activePanelTab = tab;
+        document.querySelectorAll('.panel-tab[data-tab]').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.tab === tab);
+        });
+        document.querySelectorAll('.game-panel .panel-section').forEach(section => {
+            section.classList.toggle('active', section.dataset.section === tab);
+        });
+        // Mở rộng panel nếu đang collapse
+        const panel = document.getElementById('game-panel');
+        if (panel) panel.classList.remove('collapsed');
+    }
+
+    togglePanelCollapse() {
+        const panel = document.getElementById('game-panel');
+        if (!panel) return;
+        panel.classList.toggle('collapsed');
+        const btn = document.getElementById('panel-tab-collapse');
+        if (btn) btn.textContent = panel.classList.contains('collapsed') ? '▲' : '▼';
+    }
+
+    // ===== Keyboard shortcuts =====
+    handleKeyDown(e) {
+        // Bỏ qua nếu đang gõ trong input/textarea/select
+        const target = e.target;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+            return;
+        }
+        // Bỏ qua nếu đang mở modal
+        const anyModalOpen = document.querySelector('.modal:not(.hidden)');
+        if (anyModalOpen) {
+            // Enter = xác nhận nút chính trong modal (promotion/rematch/draw)
+            if (e.key === 'Enter') {
+                // Tìm nút primary trong modal đang mở và click
+                const primary = anyModalOpen.querySelector('.btn-primary');
+                if (primary) {
+                    e.preventDefault();
+                    primary.click();
+                }
+            }
+            return;
+        }
+
+        // Phím tắt cho Analysis page
+        const analysisActive = document.getElementById('analysis-page').classList.contains('active');
+        if (analysisActive && window.Analysis) {
+            switch (e.key) {
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    Analysis.goTo(Analysis.index - 1);
+                    break;
+                case 'ArrowRight':
+                    e.preventDefault();
+                    Analysis.goTo(Analysis.index + 1);
+                    break;
+                case 'Home':
+                    e.preventDefault();
+                    Analysis.goTo(0);
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    Analysis.goTo(Analysis.pgnMoves.length);
+                    break;
+                case ' ':
+                case 'Spacebar':
+                    e.preventDefault();
+                    Analysis.togglePlay();
+                    break;
+                case 'f':
+                case 'F':
+                    e.preventDefault();
+                    Analysis.flipBoard();
+                    break;
+            }
+            return;
+        }
+
+        // Phím tắt cho Game page (chỉ khi đang chơi, không khi modal mở)
+        const gameActive = document.getElementById('game-page').classList.contains('active');
+        if (gameActive) {
+            switch (e.key) {
+                case 'f':
+                case 'F':
+                    e.preventDefault();
+                    this.flipBoard();
+                    break;
+                case 'Escape':
+                    this.clearSelection();
+                    break;
+            }
+        }
     }
 }
 
@@ -2100,7 +2575,7 @@ const Analysis = {
     pgnMoves: [],
     result: null,
     index: -1,
-    evals: {},
+    evals: {}, // { [ply]: { score, pv, depth, multipv: [{score, pv, depth}, ...] } }
     classifications: {},
     pendingPly: null,
     requestPly: null,
@@ -2110,6 +2585,12 @@ const Analysis = {
     _gen: 0,
     engineUrlValue: null,
     BOOK_PLY: 10,
+    boardFlipped: false,
+    playInterval: null,
+    _chartGeo: null,
+    _svgCache: null,
+    _engineMode: 'lite',
+    MULTI_PV_COUNT: 3,
 
     init() {
         document.getElementById('btn-analysis-back').addEventListener('click', () => this.exit());
@@ -2119,10 +2600,27 @@ const Analysis = {
         document.getElementById('btn-pgn-analyze').addEventListener('click', () => this.importFromPgnInput());
         document.getElementById('btn-analysis-export').addEventListener('click', () => this.exportPgn());
         document.getElementById('btn-analysis-start').addEventListener('click', () => this.startFullAnalysis());
+        const reviewBtn = document.getElementById('btn-analysis-review');
+        if (reviewBtn) reviewBtn.addEventListener('click', () => this.showReview());
         document.getElementById('btn-an-first').addEventListener('click', () => this.goTo(0));
         document.getElementById('btn-an-prev').addEventListener('click', () => this.goTo(this.index - 1));
+        const playBtn = document.getElementById('btn-an-play');
+        if (playBtn) playBtn.addEventListener('click', () => this.togglePlay());
         document.getElementById('btn-an-next').addEventListener('click', () => this.goTo(this.index + 1));
         document.getElementById('btn-an-last').addEventListener('click', () => this.goTo(this.pgnMoves.length));
+        const flipBtn = document.getElementById('btn-an-flip');
+        if (flipBtn) flipBtn.addEventListener('click', () => this.flipBoard());
+        const undoBtn = document.getElementById('btn-an-undo');
+        if (undoBtn) undoBtn.addEventListener('click', () => this.undoLocal());
+        const whyBtn = document.getElementById('btn-an-why');
+        if (whyBtn) whyBtn.addEventListener('click', () => this.showWhyPopup(this.index));
+        const whyCloseBtn = document.getElementById('btn-why-close');
+        if (whyCloseBtn) whyCloseBtn.addEventListener('click', () => this.hideWhyPopup());
+        const scrubEl = document.getElementById('analysis-scrub');
+        if (scrubEl) scrubEl.addEventListener('input', (e) => {
+            const v = parseInt(e.target.value, 10);
+            this.goTo(v);
+        });
         document.getElementById('analysis-chart').addEventListener('click', (e) => {
             const geo = this._chartGeo;
             if (!geo || !geo.N) return;
@@ -2214,6 +2712,9 @@ const Analysis = {
             };
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
             this.engine.postMessage('uci');
+            // Multi-PV: yêu cầu engine trả về N đường tốt nhất cho mỗi vị trí.
+            // Stockfish 18 hỗ trợ 'setoption name MultiPV value N'.
+            this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
             this.engine.postMessage('isready');
             // Bản Full cần thêm thời gian để compile WASM lớn trên máy chậm.
             const timeout = (this._engineMode === 'full') ? 180000 : 30000;
@@ -2323,7 +2824,7 @@ const Analysis = {
         if (data === 'readyok') {
             this.ready = true;
             this.failed = false;
-            this.setEngineStatus('Stockfish 18 sẵn sàng');
+            this.setEngineStatus('Stockfish 18 sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ')');
             this.analyzeCurrent();
             if (this.pendingStartAfterReady) {
                 this.pendingStartAfterReady = false;
@@ -2334,10 +2835,24 @@ const Analysis = {
         if (data.indexOf('info depth') === 0) {
             const ply = this.pendingPly;
             if (ply == null) return;
+            // Parse MultiPV: Stockfish gửi nhiều dòng "info ... multipv N ..."
+            // mỗi dòng là 1 PV. Khi MultiPV=1, không có trường multipv -> mặc định 1.
+            const mpvMatch = data.match(/multipv (\d+)/);
+            const mpvIdx = mpvMatch ? parseInt(mpvMatch[1], 10) : 1;
             const score = this.parseScore(data);
             const pv = this.parsePv(data, ply);
+            const depth = this.parseDepth(data);
             if (score != null) {
-                this.evals[ply] = { score, pv, depth: this.parseDepth(data) };
+                // Lưu trữ theo cấu trúc: evals[ply].score = best (PV 1), evals[ply].multipv[idx-1] = {...}
+                if (!this.evals[ply]) this.evals[ply] = {};
+                if (mpvIdx === 1) {
+                    // Top PV — dùng cho classification + chart
+                    this.evals[ply].score = score;
+                    this.evals[ply].pv = pv;
+                    this.evals[ply].depth = depth;
+                }
+                if (!this.evals[ply].multipv) this.evals[ply].multipv = [];
+                this.evals[ply].multipv[mpvIdx - 1] = { score, pv, depth };
             }
             if (ply === this.index) this.renderEval(ply);
             return;
@@ -2346,6 +2861,7 @@ const Analysis = {
             const ply = this.pendingPly;
             if (ply != null && ply === this.index) {
                 this.renderEval(ply);
+                this.renderMultiPV(ply);
             }
             this.pendingPly = null;
             // Đang chạy "phân tích toàn bộ": cập nhật nhãn rồi sang vị trí kế tiếp
@@ -2418,10 +2934,255 @@ const Analysis = {
         }
 
         document.getElementById('analysis-position-label').textContent = idx + '/' + maxIdx;
+        // Cập nhật scrub bar
+        const scrub = document.getElementById('analysis-scrub');
+        if (scrub) {
+            scrub.max = String(maxIdx);
+            scrub.value = String(idx);
+        }
+        const scrubLabel = document.getElementById('analysis-scrub-label');
+        if (scrubLabel) scrubLabel.textContent = idx + ' / ' + maxIdx;
         this.renderBoard();
         this.renderMoveList();
         this.renderPgnText();
+        this.renderOpeningName(idx);
+        this.renderPhase(idx);
         this.analyzeCurrent();
+        // Nếu đã có eval từ lần phân tích trước, render ngay không đợi engine
+        if (this.evals[idx]) {
+            this.renderEval(idx);
+            this.renderMultiPV(idx);
+        }
+        this.renderPhaseStats();
+    },
+
+    // ===== Opening name detection =====
+    // Database khai cuộc rút gọn (top 30 phổ biến). Dựa trên N nước đầu tiên.
+    // Không đầy đủ như Lichess/Chess.com nhưng đủ để gọi tên các khai cuộc phổ biến.
+    OPENINGS: [
+        { moves: ['e4','e5','Nf3','Nc6','Bb5'], name: 'Ruy Lopez (Tây Ban Nha)', family: 'Open Game' },
+        { moves: ['e4','e5','Nf3','Nc6','Bc4'], name: 'Italian Game (Ý)', family: 'Open Game' },
+        { moves: ['e4','e5','Nf3','Nc6','d4'], name: 'Scotch Game', family: 'Open Game' },
+        { moves: ['e4','e5','Nf3','Nc6','Nf6'], name: 'Four Knights Game', family: 'Open Game' },
+        { moves: ['e4','e5','Nf3','d5'], name: 'Elephant Gambit', family: 'Open Game' },
+        { moves: ['e4','e5','f4'], name: "King's Gambit (Gambit Vua)", family: 'Open Game' },
+        { moves: ['e4','e5','Bc4','Nf6'], name: 'Italian Game, Two Knights Defense', family: 'Open Game' },
+        { moves: ['e4','c5'], name: 'Sicilian Defense (Sicilia)', family: 'Open Game' },
+        { moves: ['e4','c5','Nf3','d6','d4','cxd4','Nxd4','Nf6','Nc3'], name: 'Sicilian Defense, Najdorf Variation', family: 'Sicilian' },
+        { moves: ['e4','c5','Nf3','d6','d4','cxd4','Nxd4','Nf6','Nc3','g6'], name: 'Sicilian Defense, Dragon Variation', family: 'Sicilian' },
+        { moves: ['e4','c5','Nf3','Nc6','d4','cxd4','Nxd4','Nf6','Nc3','e5'], name: 'Sicilian Defense, Pelikan/Sveshnikov', family: 'Sicilian' },
+        { moves: ['e4','c5','Nf3','e6'], name: 'Sicilian Defense, Taimanov Variation', family: 'Sicilian' },
+        { moves: ['e4','e6'], name: 'French Defense (Pháp)', family: 'Semi-Open Game' },
+        { moves: ['e4','c6'], name: 'Caro-Kann Defense', family: 'Semi-Open Game' },
+        { moves: ['e4','d5'], name: 'Scandinavian Defense', family: 'Semi-Open Game' },
+        { moves: ['e4','d6'], name: "Pirc Defense", family: 'Semi-Open Game' },
+        { moves: ['e4','g6'], name: 'Modern Defense', family: 'Semi-Open Game' },
+        { moves: ['e4','Nf6'], name: 'Alekhine Defense', family: 'Semi-Open Game' },
+        { moves: ['d4','d5'], name: "Queen's Gambit (Gambit Hậu)", family: 'Closed Game' },
+        { moves: ['d4','d5','c4','e6'], name: "Queen's Gambit Declined", family: 'Closed Game' },
+        { moves: ['d4','d5','c4','c6'], name: 'Slav Defense', family: 'Closed Game' },
+        { moves: ['d4','d5','c4','dxc4'], name: "Queen's Gambit Accepted", family: 'Closed Game' },
+        { moves: ['d4','Nf6','c4','g6','Nc3','Bg7'], name: "King's Indian Defense (KID)", family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','e6','Nc3','Bb4'], name: 'Nimzo-Indian Defense', family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','e6','Nf3','b6'], name: "Queen's Indian Defense", family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','c5'], name: 'Benoni Defense', family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','g6'], name: "King's Indian Defense", family: 'Indian Defense' },
+        { moves: ['d4','f5'], name: 'Dutch Defense', family: 'Closed Game' },
+        { moves: ['c4'], name: 'English Opening', family: 'Flank Opening' },
+        { moves: ['Nf3'], name: "Réti Opening", family: 'Flank Opening' },
+        { moves: ['g3'], name: 'Hungarian Opening / Benko Opening', family: 'Flank Opening' },
+        { moves: ['b3'], name: 'Larsen Opening', family: 'Flank Opening' },
+        { moves: ['b4'], name: 'Sokolsky Opening / Polish Opening', family: 'Flank Opening' },
+        { moves: ['f4'], name: "Bird's Opening", family: 'Flank Opening' },
+    ],
+
+    renderOpeningName(idx) {
+        const el = document.getElementById('analysis-opening-name');
+        if (!el) return;
+        const matched = this.detectOpening(this.pgnMoves.slice(0, idx));
+        if (matched) {
+            el.textContent = 'Khai cuộc: ' + matched.name;
+            el.title = matched.family + ' — ' + matched.name;
+        } else if (idx === 0) {
+            el.textContent = 'Khai cuộc: Vị trí ban đầu';
+            el.title = '';
+        } else {
+            el.textContent = 'Khai cuộc: Không xác định / biến phụ';
+            el.title = '';
+        }
+    },
+
+    detectOpening(movesPlayed) {
+        // Tìm opening có prefix dài nhất khớp với movesPlayed.
+        let best = null;
+        let bestLen = 0;
+        for (const op of this.OPENINGS) {
+            if (movesPlayed.length < op.moves.length) continue;
+            let ok = true;
+            for (let i = 0; i < op.moves.length; i++) {
+                if (movesPlayed[i] !== op.moves[i]) { ok = false; break; }
+            }
+            if (ok && op.moves.length > bestLen) {
+                best = op;
+                bestLen = op.moves.length;
+            }
+        }
+        return best;
+    },
+
+    // ===== Phase detection (opening / middlegame / endgame) =====
+    // Quy tắc xấp xỉ Lichess:
+    //   opening  : <= 10 ply và chưa ra khỏi sách khai cuộc
+    //   endgame  : trên board còn <= 6 quân không tính tốt (hoặc <= 10 quân tổng cộng)
+    //   middlegame: phần giữa
+    getPhase(idx) {
+        if (idx <= 0) return 'opening';
+        const ch = new Chess();
+        for (let i = 0; i < idx; i++) {
+            try { ch.move(this.pgnMoves[i]); } catch (e) { break; }
+        }
+        const board = ch.board();
+        let nonPawn = 0;
+        let totalPieces = 0;
+        for (const row of board) {
+            for (const p of row) {
+                if (!p) continue;
+                totalPieces++;
+                if (p.type !== 'p' && p.type !== 'k') nonPawn++;
+            }
+        }
+        if (idx <= 10) return 'opening';
+        if (nonPawn <= 6 || totalPieces <= 10) return 'endgame';
+        return 'middlegame';
+    },
+
+    renderPhase(idx) {
+        const el = document.getElementById('analysis-phase');
+        if (!el) return;
+        const phase = this.getPhase(idx);
+        const label = { opening: 'Khai cuộc', middlegame: 'Trung cuộc', endgame: 'Tàn cuộc' }[phase] || phase;
+        el.textContent = 'Giai đoạn: ' + label;
+        el.dataset.phase = phase;
+    },
+
+    renderPhaseStats() {
+        const el = document.getElementById('analysis-phase-stats');
+        if (!el) return;
+        // Tính trung bình eval theo từng phase (abs cp, quy về góc nhìn Trắng)
+        const phaseRanges = { opening: [], middlegame: [], endgame: [] };
+        let lastPhase = null;
+        for (let i = 0; i <= this.pgnMoves.length; i++) {
+            const phase = this.getPhase(i);
+            if (phase !== lastPhase || lastPhase === null) {
+                // Bắt đầu phase mới
+                if (!phaseRanges[phase]) phaseRanges[phase] = [];
+            }
+            lastPhase = phase;
+            const ev = this.evals[i];
+            if (ev && ev.score) {
+                const cp = this.cpOf(ev.score);
+                // Đổi dấu về góc nhìn Trắng (eval sau ply lẻ là của Đen)
+                const whiteCp = (i % 2 === 0) ? cp : -cp;
+                phaseRanges[phase].push(whiteCp);
+            }
+        }
+        const phaseLabels = {
+            opening: 'Khai cuộc (≤10 nước)',
+            middlegame: 'Trung cuộc',
+            endgame: 'Tàn cuộc (≤6 quân không phải tốt)'
+        };
+        let html = '';
+        for (const phase of ['opening', 'middlegame', 'endgame']) {
+            const arr = phaseRanges[phase];
+            if (!arr || !arr.length) {
+                html += '<div class="phase-stat-row"><span class="phase-stat-label">' + phaseLabels[phase] + '</span><span class="phase-stat-val">—</span></div>';
+                continue;
+            }
+            const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+            const sign = avg > 0 ? '+' : '';
+            const txt = Math.abs(avg) >= 100000
+                ? (avg > 0 ? 'M thắng Trắng' : 'M thắng Đen')
+                : (sign + (avg / 100).toFixed(2));
+            html += '<div class="phase-stat-row"><span class="phase-stat-label">' + phaseLabels[phase] + '</span><span class="phase-stat-val">' + txt + '</span></div>';
+        }
+        el.innerHTML = html;
+    },
+
+    // ===== Multi-PV render =====
+    renderMultiPV(ply) {
+        const container = document.getElementById('analysis-multipv');
+        if (!container) return;
+        const ev = this.evals[ply];
+        if (!ev || !ev.multipv || !ev.multipv.length) {
+            container.textContent = '—';
+            return;
+        }
+        let html = '';
+        for (let i = 0; i < ev.multipv.length; i++) {
+            const line = ev.multipv[i];
+            if (!line) continue;
+            const num = i + 1;
+            const scoreText = this.formatScore(line.score);
+            const pvText = (line.pv || []).slice(0, 8).join(' ');
+            const isBest = i === 0;
+            html += '<div class="mpv-row' + (isBest ? ' mpv-best' : '') + '">'
+                + '<span class="mpv-num">' + num + '.</span>'
+                + '<span class="mpv-eval">' + scoreText + '</span>'
+                + '<span class="mpv-line">' + (pvText || '—') + '</span>'
+                + '</div>';
+        }
+        container.innerHTML = html;
+    },
+
+    // ===== Flip board =====
+    flipBoard() {
+        this.boardFlipped = !this.boardFlipped;
+        this.renderBoard();
+        showToast(this.boardFlipped ? 'Đã lật bàn cờ phân tích' : 'Góc nhìn mặc định', 'info', 1500);
+    },
+
+    // ===== Undo local (chỉ trong analysis mode, không ảnh hưởng game thật) =====
+    undoLocal() {
+        // Lùi 1 nước trong PGN locally (chỉ khi không đang chạy batch).
+        if (this.batchQueue) {
+            showToast('Đang phân tích toàn bộ, không thể lùi', 'warning');
+            return;
+        }
+        if (!this.pgnMoves.length) {
+            showToast('Chưa có nước đi nào', 'warning');
+            return;
+        }
+        // Xóa eval của nước cuối
+        const removed = this.pgnMoves.pop();
+        delete this.evals[this.pgnMoves.length + 1];
+        delete this.classifications[this.pgnMoves.length + 1];
+        showToast('Đã lùi: ' + removed, 'info', 1500);
+        this.goTo(Math.min(this.index, this.pgnMoves.length));
+        this.renderPgnText();
+    },
+
+    // ===== Play / pause replay =====
+    togglePlay() {
+        const btn = document.getElementById('btn-an-play');
+        if (this.playInterval) {
+            clearInterval(this.playInterval);
+            this.playInterval = null;
+            if (btn) btn.textContent = '▶';
+            return;
+        }
+        if (this.index >= this.pgnMoves.length) {
+            this.goTo(0);
+        }
+        if (btn) btn.textContent = '⏸';
+        this.playInterval = setInterval(() => {
+            if (this.index >= this.pgnMoves.length) {
+                clearInterval(this.playInterval);
+                this.playInterval = null;
+                if (btn) btn.textContent = '▶';
+                return;
+            }
+            this.goTo(this.index + 1);
+        }, 1200);
     },
 
     analyzeCurrent() {
@@ -2647,6 +3408,9 @@ const Analysis = {
         board.innerHTML = '';
         const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
         const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
+        // Hỗ trợ flip board (xem từ góc nhìn Đen)
+        const displayFiles = this.boardFlipped ? [...files].reverse() : files;
+        const displayRanks = this.boardFlipped ? [...ranks].reverse() : ranks;
         let lastFrom = null, lastTo = null;
         if (this.index > 0 && this.index <= this.pgnMoves.length) {
             const ch = new Chess();
@@ -2663,8 +3427,8 @@ const Analysis = {
         for (let r = 0; r < 8; r++) {
             for (let f = 0; f < 8; f++) {
                 const square = document.createElement('div');
-                const file = files[f];
-                const rank = ranks[r];
+                const file = displayFiles[f];
+                const rank = displayRanks[r];
                 const squareName = file + rank;
                 const isLight = (r + f) % 2 === 0;
                 square.className = `square ${isLight ? 'light' : 'dark'}`;
@@ -3015,6 +3779,125 @@ const Analysis = {
         const el = document.getElementById('analysis-engine-status');
         el.textContent = text;
         el.classList.toggle('ready', !error);
+    },
+
+    // ===== Review Mode: top 3 turning points =====
+    // Tìm 3 khoảnh khắc có độ rớt % thắng lớn nhất trong ván.
+    showReview() {
+        if (!this.pgnMoves.length) {
+            showToast('Chưa có ván cờ nào để review. Bấm "Bắt đầu phân tích" trước.', 'warning');
+            return;
+        }
+        const modal = document.getElementById('review-modal');
+        const list = document.getElementById('review-list');
+        if (!modal || !list) return;
+
+        // Tính delta cho mỗi nước
+        const points = [];
+        for (let i = 1; i <= this.pgnMoves.length; i++) {
+            const c = this.classifications[i];
+            if (c && typeof c.delta === 'number') {
+                points.push({ ply: i, delta: c.delta, label: c.label, winBefore: c.winBefore, winAfter: c.winAfter });
+            }
+        }
+        if (!points.length) {
+            list.innerHTML = 'Chưa có dữ liệu phân tích. Hãy bấm "Bắt đầu phân tích" trước.';
+            modal.classList.remove('hidden');
+            return;
+        }
+        // Sắp xếp theo delta giảm dần, lấy top 3
+        const top3 = points.slice().sort((a, b) => b.delta - a.delta).slice(0, 3);
+        let html = '';
+        for (let rank = 0; rank < top3.length; rank++) {
+            const p = top3[rank];
+            const moveNum = Math.ceil(p.ply / 2);
+            const isWhite = p.ply % 2 === 1;
+            const side = isWhite ? 'Trắng' : 'Đen';
+            const san = this.pgnMoves[p.ply - 1] || '?';
+            const explanation = this.labelExplanation(p.label, p.delta, p.winBefore, p.winAfter);
+            html += '<div class="review-item review-' + p.label.toLowerCase() + '">'
+                + '<div class="review-rank">#' + (rank + 1) + '</div>'
+                + '<div class="review-main">'
+                + '<div class="review-move">' + moveNum + (isWhite ? '.' : '...') + ' ' + san + ' <span class="review-side">(' + side + ')</span></div>'
+                + '<div class="review-label">' + p.label + ' — rớt ' + p.delta.toFixed(1) + '% thắng</div>'
+                + '<div class="review-explain">' + explanation + '</div>'
+                + '<div class="review-eval">Trước: ' + (p.winBefore != null ? p.winBefore.toFixed(0) + '%' : '?') + ' → Sau: ' + (p.winAfter != null ? p.winAfter.toFixed(0) + '%' : '?') + '</div>'
+                + '</div>'
+                + '<button class="btn btn-secondary review-goto" data-ply="' + p.ply + '">Xem nước này</button>'
+                + '</div>';
+        }
+        list.innerHTML = html;
+        // Bind click cho nút "Xem nước này"
+        list.querySelectorAll('.review-goto').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const ply = parseInt(btn.dataset.ply, 10);
+                modal.classList.add('hidden');
+                this.goTo(ply);
+            });
+        });
+        modal.classList.remove('hidden');
+    },
+
+    // ===== "Why this is bad" popup =====
+    showWhyPopup(ply) {
+        const popup = document.getElementById('why-popup');
+        const body = document.getElementById('why-body');
+        if (!popup || !body) return;
+        if (ply < 1 || ply > this.pgnMoves.length) {
+            showToast('Chọn một nước đi để xem giải thích', 'info');
+            return;
+        }
+        const c = this.classifications[ply];
+        const san = this.pgnMoves[ply - 1] || '?';
+        const moveNum = Math.ceil(ply / 2);
+        const isWhite = ply % 2 === 1;
+        const side = isWhite ? 'Trắng' : 'Đen';
+        const before = this.evals[ply - 1];
+        const after = this.evals[ply];
+        const bestSan = before && before.pv ? before.pv[0] : null;
+
+        let html = '<div class="why-move">' + moveNum + (isWhite ? '.' : '...') + ' ' + san + ' <span class="why-side">(' + side + ')</span></div>';
+        if (c) {
+            html += '<div class="why-label why-label-' + c.label.toLowerCase() + '">' + c.label + '</div>';
+            html += '<div class="why-explain">' + this.labelExplanation(c.label, c.delta, c.winBefore, c.winAfter) + '</div>';
+        } else {
+            html += '<div class="why-explain">Chưa phân tích nước này. Bấm "Bắt đầu phân tích" để có nhãn đánh giá.</div>';
+        }
+        if (bestSan && bestSan !== san) {
+            html += '<div class="why-best">Nước tốt nhất lúc đó: <b>' + bestSan + '</b></div>';
+        } else if (bestSan === san) {
+            html += '<div class="why-best">Đây chính là nước tốt nhất mà engine đề xuất!</div>';
+        }
+        if (after && after.score) {
+            html += '<div class="why-eval">Đánh giá sau nước này: ' + this.formatScore(after.score) + '</div>';
+        }
+        body.innerHTML = html;
+        popup.classList.remove('hidden');
+    },
+
+    hideWhyPopup() {
+        const popup = document.getElementById('why-popup');
+        if (popup) popup.classList.add('hidden');
+    },
+
+    // ===== Giải thích nhãn phân loại (ngôn ngữ người thường) =====
+    labelExplanation(label, delta, winBefore, winAfter) {
+        const deltaTxt = delta != null ? delta.toFixed(1) : '?';
+        const beforeTxt = winBefore != null ? winBefore.toFixed(0) : '?';
+        const afterTxt = winAfter != null ? winAfter.toFixed(0) : '?';
+        const explanations = {
+            Brilliant: 'Nước thiên tài! Bạn hy sinh material nhưng vẫn giữ được lợi thế hoặc giành lợi thế lớn. Engine thấy đường đi sâu mà người thường khó thấy.',
+            Great: 'Nước rất tốt — bạn cứu được ván từ thế khó, biến tình thế bất lợi thành cầm cờ hoặc thắng.',
+            Best: 'Đúng nước engine đề xuất. Bạn đã tìm ra nước đi tốt nhất trong tình huống này.',
+            Excellent: 'Nước gần tối ưu. Đánh giá rớt rất ít so với nước tốt nhất — bạn đang chơi rất chính xác.',
+            Good: 'Nước hợp lý. Có thể không phải nước tốt nhất nhưng vẫn giữ được lợi thế.',
+            Book: 'Nước theo lý thuyết khai cuộc. Đây là nước đã được nghiên cứu rộng rãi.',
+            Inaccuracy: 'Không chính xác. Bạn rớt khoảng ' + deltaTxt + '% thắng. Không nghiêm trọng nhưng có nước chính xác hơn.',
+            Mistake: 'Sai lầm. Bạn rớt ' + deltaTxt + '% thắng (từ ' + beforeTxt + '% xuống ' + afterTxt + '%). Có nước rõ ràng tốt hơn.',
+            Missed: 'Bỏ lỡ cơ hội thắng lớn. Bạn đang có ' + beforeTxt + '% thắng nhưng chọn nước không tối ưu, bỏ lỡ cơ hội quyết định.',
+            Blunder: 'Lỗi nghiêm trọng! Bạn rớt ' + deltaTxt + '% thắng (từ ' + beforeTxt + '% xuống ' + afterTxt + '%). Có thể mất material hoặc bị chiếu hết.'
+        };
+        return explanations[label] || ('Nước đi với mức rớt ' + deltaTxt + '% thắng.');
     }
 };
 

@@ -1,0 +1,29 @@
+{
+  "name": "pchess.github.io",
+  "version": "1.0.0",
+  "description": "PChess là web game cờ vua 2 người chơi qua **WebSocket relay** chạy trên **Cloudflare Durable Objects**. Server là nguồn sự thật (server-authoritative): mọi nước đi được validate bằng chess.js ngay trên server, chống gian lận kiểu sửa code trình duyệt.",
+  "main": "serve.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pongb12/pchess.github.io.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/pongb12/pchess.github.io/issues"
+  },
+  "homepage": "https://github.com/pongb12/pchess.github.io#readme",
+  "devDependencies": {
+    "wrangler": "^4.120.0",
+    "ws": "^8.21.3"
+  }
+}

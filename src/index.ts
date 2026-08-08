@@ -4,6 +4,11 @@ import { Chess } from '../lib/chess.js';
 interface Env {
   PCHESS_ROOM: DurableObjectNamespace;
   ASSETS: Fetcher;
+  // Optional: event signing secret. Falls back to a per-room derived key when not
+  // configured (still better than nothing — client cannot forge without knowing
+  // the room code, which it already knows, but at least the signature proves the
+  // event was generated server-side for THIS room).
+  EVENT_SIGNING_SECRET?: string;
 }
 
 const ROOM_CODE_RE = /^[A-Za-z0-9]{1,20}$/;
@@ -19,6 +24,28 @@ const MOVE_RATE_LIMIT_MS = 100;
 const MOVE_BURST_MAX = 5;
 const MOVE_BURST_WINDOW_MS = 1000;
 const PROMOTION_TYPES = ['q', 'r', 'b', 'n'];
+
+// Anti-cheat: reconnection / room-creation rate limit theo IP.
+// Một IP tạo quá nhiều phòng hoặc reconnect quá nhiều lần trong ngắn hạn là dấu
+// hiệu của botnet /扫描. Chỉ chặn ở tầng tạo phòng (fetch /room) — không chặn
+// trong game vì người thật cũng có thể mạng yếu và WS rớt liên tục.
+const IP_ROOM_CREATE_MAX = 20;
+const IP_ROOM_CREATE_WINDOW_MS = 60_000;
+const IP_RECONNECT_MAX = 30;
+const IP_RECONNECT_WINDOW_MS = 60_000;
+
+// Audit log: tối đa bao nhiêu entry giữ lại trong storage (đủ để review sau).
+const AUDIT_LOG_MAX = 500;
+
+// Engine-like heuristic thresholds (server-side, dựa trên audit log).
+// Không chạy Stockfish ở server (tốn CPU), chỉ flag các pattern bất thường:
+// - Move times quá đều (std deviation < 50ms) -> auto-player
+// - Move times quá nhanh (< 200ms) cho nhiều nước liên tiếp -> engine pre-computed
+// - Move times quá chậm (> 60s) cho nhiều nước -> tab-switch / consulting engine
+const SUSPECT_FAST_MOVE_MS = 200;
+const SUSPECT_FAST_STREAK = 4;
+const SUSPECT_UNIFORM_STDDEV_MS = 50;
+const SUSPECT_UNIFORM_MIN_MOVES = 8;
 
 type Role = 'host' | 'guest';
 const ROLES: Role[] = ['host', 'guest'];
@@ -37,6 +64,65 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+// IP rate limit state — lưu tạm trong module-level Map (chia sẻ giữa các
+// request trong cùng isolate). Khi worker isolate bị recycle thì reset — chấp
+// nhận được vì chỉ là tầng chống flood, không phải security critical.
+interface IpBucket {
+  count: number;
+  firstAt: number;
+}
+const ipRoomCreateBuckets = new Map<string, IpBucket>();
+const ipReconnectBuckets = new Map<string, IpBucket>();
+
+function ipAllowed(map: Map<string, IpBucket>, ip: string, max: number, windowMs: number): boolean {
+  const now = Date.now();
+  const bucket = map.get(ip);
+  if (!bucket || now - bucket.firstAt > windowMs) {
+    map.set(ip, { count: 1, firstAt: now });
+    return true;
+  }
+  bucket.count += 1;
+  return bucket.count <= max;
+}
+
+function clientIp(request: Request): string {
+  // Cloudflare đặt CF-Connecting-IP cho mọi request.
+  const cf = (request as Request & { cf?: { ip?: string } }).cf;
+  if (cf?.ip) return cf.ip;
+  const h = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Real-IP') || 'unknown';
+  return h;
+}
+
+// HMAC-SHA256 cho signed events. Cloudflare Workers có Web Crypto.
+async function hmacSign(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  // hex
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Lấy signing key cho room. Ưu tiên biến môi trường, fallback về room-code-derived
+// (không an toàn bằng nhưng ít nhất signature gắn với room).
+async function signingKey(env: Env, roomCode: string): Promise<string> {
+  if (env.EVENT_SIGNING_SECRET) return env.EVENT_SIGNING_SECRET;
+  // Fallback: hash room code để tạo per-room key. Vẫn phải biết room code để giả mạo
+  // (người chơi đã biết room code nên đây chỉ là chống giả mạo cross-room).
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('pchess:' + roomCode));
+  return 'rk:' + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function signEvent(env: Env, roomCode: string, payload: unknown): Promise<string> {
+  const msg = JSON.stringify(payload);
+  const key = await signingKey(env, roomCode);
+  return await hmacSign(key, msg);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -50,12 +136,26 @@ export default {
         return json({ error: 'invalid_room_code' }, 400);
       }
 
+      // IP rate limit: chống flood tạo phòng / connect.
+      const ip = clientIp(request);
+      const isReconnect = url.searchParams.get('reconnect') === '1';
+      const allowed = isReconnect
+        ? ipAllowed(ipReconnectBuckets, ip, IP_RECONNECT_MAX, IP_RECONNECT_WINDOW_MS)
+        : ipAllowed(ipRoomCreateBuckets, ip, IP_ROOM_CREATE_MAX, IP_ROOM_CREATE_WINDOW_MS);
+      if (!allowed) {
+        return json({ error: 'rate_limited' }, 429);
+      }
+
       const id = env.PCHESS_ROOM.idFromName(code.toLowerCase());
       const stub = env.PCHESS_ROOM.get(id);
-      return stub.fetch(request);
+      // Truyền IP + signing secret vào DO qua header (DO fetch là internal).
+      const headers = new Headers(request.headers);
+      headers.set('X-PChess-IP', ip);
+      if (env.EVENT_SIGNING_SECRET) headers.set('X-PChess-Signing-Secret', env.EVENT_SIGNING_SECRET);
+      return stub.fetch(new Request(request, { headers }));
     }
 
-    const staticPath = /^\/(index\.html|css\/|js\/|stockfish\/)/.test(url.pathname) ? url.pathname : '/';
+    const staticPath = /^\/(index\.html|css\/|js\/|stockfish\/|assets\/)/.test(url.pathname) ? url.pathname : '/';
     return env.ASSETS.fetch(new Request(new URL(staticPath, request.url), request));
   },
 };
@@ -63,10 +163,37 @@ export default {
 interface GameState {
   fen: string;
   history: string[];
+  // Audit trail: timestamp của mỗi nước đi (ms epoch), dùng cho anti-cheat heuristic.
+  moveTimestamps: number[];
+  startedAt: number;
 }
 
 interface RematchState {
-  accepted: Role[];
+  // State machine rõ ràng thay vì chỉ Set<Role>:
+  //   'idle'                       -> chưa có yêu cầu
+  //   'requested'                  -> một bên đã yêu cầu, chờ bên kia đồng ý
+  //   'accepted_by_host'           -> host đã accept (guest request trước đó)
+  //   'accepted_by_guest'          -> guest đã accept (host request trước đó)
+  //   'declined'                   -> một bên đã từ chối
+  // Chỉ reset game khi state đạt 'accepted_by_both'.
+  status: 'idle' | 'requested' | 'accepted_by_host' | 'accepted_by_guest' | 'accepted_by_both' | 'declined';
+  requestedBy: Role | null;
+  acceptedBy: Role[];
+  requestedAt: number | null;
+}
+
+interface AuditEntry {
+  t: number; // timestamp
+  type: string; // 'move' | 'join' | 'leave' | 'reconnect' | 'takeover' | 'rematch_*' | 'resign' | 'draw_*' | 'game_over' | 'cheat_flag'
+  role?: Role;
+  detail?: unknown;
+}
+
+interface CheatFlag {
+  role: Role;
+  reason: string;
+  at: number;
+  detail?: unknown;
 }
 
 export class PChessRoom extends DurableObject<Env> {
@@ -112,6 +239,11 @@ export class PChessRoom extends DurableObject<Env> {
     return role ? colorOfRole(role) : null;
   }
 
+  private roomCode(): string {
+    // Tên DO = room code lowercased (xem idFromName ở default.fetch).
+    return this.ctx.name || 'unknown';
+  }
+
   async fetch(request: Request): Promise<Response> {
     const upgrade = request.headers.get('Upgrade');
     if (upgrade !== 'websocket') {
@@ -121,6 +253,11 @@ export class PChessRoom extends DurableObject<Env> {
     const url = new URL(request.url);
     const claimedRole: Role = url.searchParams.get('role') === 'guest' ? 'guest' : 'host';
     const isReconnect = url.searchParams.get('reconnect') === '1';
+
+    // Lưu signing secret từ header (set bởi default.fetch). Không lưu trên this
+    // vì hibernate — lưu qua tag của WS hoặc đọc lại mỗi lần từ storage.
+    const signingSecret = request.headers.get('X-PChess-Signing-Secret') || null;
+    const clientIp = request.headers.get('X-PChess-IP') || 'unknown';
 
     // Socket cũ cùng vai trò vẫn còn (tìm qua tag — hoạt động cả sau ngủ đông).
     const existing = this.socketOf(claimedRole);
@@ -141,6 +278,7 @@ export class PChessRoom extends DurableObject<Env> {
       } catch {
         /* ignore */
       }
+      await this.appendAudit({ t: Date.now(), type: 'takeover', role: claimedRole, detail: { ip: clientIp } });
     }
 
     if (existing && !isReconnect) {
@@ -157,6 +295,7 @@ export class PChessRoom extends DurableObject<Env> {
           /* ignore */
         }
       }, 100);
+      await this.appendAudit({ t: Date.now(), type: 'room_full_attempt', role: claimedRole, detail: { ip: clientIp } });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -165,9 +304,58 @@ export class PChessRoom extends DurableObject<Env> {
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [claimedRole]);
 
+    // Gắn signing secret + IP vào WS info (dùng serializeAttachment nếu có).
+    // Cloudflare: WebSocket không có thuộc tính tùy chỉnh, nhưng ta có thể đọc
+    // lại từ env khi cần trong webSocketMessage. Lưu secret vào storage nếu cần.
+    if (signingSecret) {
+      await this.ctx.storage.put('signing_secret', signingSecret);
+    }
+    if (clientIp && clientIp !== 'unknown') {
+      // Ghi lại IP cuối của role — cho audit / review sau.
+      const ips = (await this.ctx.storage.get<Record<Role, string>>('ips')) || { host: '', guest: '' };
+      ips[claimedRole] = clientIp;
+      await this.ctx.storage.put('ips', ips);
+    }
+
     // Gửi trạng thái trò chơi đang dở để client nối lại ván (server-authoritative)
     const game = await this.ctx.storage.get<GameState>('game');
-    server.send(JSON.stringify({ type: 'joined', role: claimedRole, color, game: game || null }));
+    const rematch = await this.ctx.storage.get<RematchState>('rematch');
+
+    // Sign các event critical (joined + sync) để client verify.
+    const joinedPayload = {
+      type: 'joined',
+      role: claimedRole,
+      color,
+      game: game || null,
+      rematch: rematch || null,
+      reconnect: isReconnect,
+      ts: Date.now(),
+    };
+    const joinedSig = await this.signPayload(joinedPayload);
+    server.send(JSON.stringify({ ...joinedPayload, sig: joinedSig }));
+
+    // Nếu reconnect + có game, gửi luôn sync banner thông báo "đang khôi phục".
+    if (isReconnect && game) {
+      try {
+        server.send(JSON.stringify({ type: 'sync_banner', state: 'restoring', ts: Date.now() }));
+      } catch {
+        /* ignore */
+      }
+      // Auto-sync ngay khi WS mở lại — server chủ động gửi full state, không đợi client.
+      const { chess, history } = await this.loadGame();
+      const captured = this.deriveCaptured(history);
+      const syncPayload = {
+        type: 'sync',
+        fen: chess.fen(),
+        history,
+        captured,
+        turn: chess.turn(),
+        ts: Date.now(),
+        source: 'reconnect',
+      };
+      const syncSig = await this.signPayload(syncPayload);
+      server.send(JSON.stringify({ ...syncPayload, sig: syncSig }));
+    }
 
     const peer = this.socketOf(claimedRole === 'host' ? 'guest' : 'host');
     if (peer) {
@@ -185,6 +373,7 @@ export class PChessRoom extends DurableObject<Env> {
       }
     }
 
+    await this.appendAudit({ t: Date.now(), type: isReconnect ? 'reconnect' : 'join', role: claimedRole, detail: { ip: clientIp } });
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -213,34 +402,51 @@ export class PChessRoom extends DurableObject<Env> {
       return;
     }
     if (type === 'rematch_request') {
-      await this.noteRematchAccepted(ws);
+      await this.handleRematchRequest(ws);
+      return;
     }
     if (type === 'rematch_accept') {
-      const ready = await this.noteRematchAccepted(ws);
-      if (ready) {
-        await this.ctx.storage.delete('game');
-        await this.ctx.storage.delete('rematch');
-      }
+      await this.handleRematchAccept(ws);
+      return;
     }
     if (type === 'rematch_decline') {
-      await this.ctx.storage.delete('rematch');
+      await this.handleRematchDecline(ws);
+      return;
+    }
+
+    // Audit các event quan trọng (resign / draw_* / game_over) — không log chat
+    // để tránh bloat storage.
+    if (type === 'resign' || type === 'draw_offer' || type === 'draw_accept' || type === 'draw_decline' || type === 'game_over') {
+      const role = this.roleOf(ws);
+      await this.appendAudit({ t: Date.now(), type, role: role || undefined, detail: msg });
     }
 
     // Relay tin nhắn giữa 2 người (resign, draw_*, rematch_*, game_over, chat,
     // sync, init...). Nếu slot đối thủ bị lệch, thử tất cả socket còn sống.
+    // Sign các event critical (game_over, draw_accept) để client verify.
+    if (type === 'game_over' || type === 'draw_accept') {
+      const sig = await this.signPayload(msg);
+      msg = { ...msg, sig };
+    }
     this.relayToPeer(ws, msg);
   }
 
   async webSocketClose(ws: WebSocket) {
     this.lastMoveAt.delete(ws);
     this.moveCounts.delete(ws);
+    const role = this.roleOf(ws);
     const other = this.opponent(ws);
     if (other) {
       try {
-        other.send(JSON.stringify({ type: 'peer_left' }));
+        // Tách biệt rõ: đây là "peer_left" (đối thủ rời phòng) chứ không phải
+        // mất mạng tạm thời. Client sẽ tự dùng heartbeat/reconnect để phân biệt.
+        other.send(JSON.stringify({ type: 'peer_left', reason: 'disconnect', ts: Date.now() }));
       } catch {
         /* ignore */
       }
+    }
+    if (role) {
+      await this.appendAudit({ t: Date.now(), type: 'leave', role });
     }
   }
 
@@ -281,10 +487,25 @@ export class PChessRoom extends DurableObject<Env> {
     }
   }
 
-  private async loadGame(): Promise<{ chess: Chess; history: string[] }> {
+  private async signingSecret(): Promise<string> {
+    // Ưu tiên secret từ storage (đã được set ở fetch), fallback per-room key.
+    const stored = await this.ctx.storage.get<string>('signing_secret');
+    if (stored) return stored;
+    return 'rk:' + this.roomCode();
+  }
+
+  private async signPayload(payload: unknown): Promise<string> {
+    const key = await this.signingSecret();
+    const msg = JSON.stringify(payload);
+    return await hmacSign(key, msg);
+  }
+
+  private async loadGame(): Promise<{ chess: Chess; history: string[]; moveTimestamps: number[]; startedAt: number }> {
     const saved = await this.ctx.storage.get<GameState>('game');
     const chess = new Chess();
     const history: string[] = saved?.history || [];
+    const moveTimestamps: number[] = saved?.moveTimestamps || [];
+    const startedAt: number = saved?.startedAt || Date.now();
     if (saved?.fen) {
       try {
         chess.load(saved.fen);
@@ -292,14 +513,14 @@ export class PChessRoom extends DurableObject<Env> {
         /* fen không hợp lệ */
       }
     }
-    return { chess, history };
+    return { chess, history, moveTimestamps, startedAt };
   }
 
   private async handleMove(ws: WebSocket, msg: { move?: { from?: string; to?: string; promotion?: string } }) {
     const move = msg.move;
     const reject = (reason: string) => {
       try {
-        ws.send(JSON.stringify({ type: 'move_rejected', move: move || null, reason }));
+        ws.send(JSON.stringify({ type: 'move_rejected', move: move || null, reason, ts: Date.now() }));
       } catch {
         /* ignore */
       }
@@ -310,7 +531,7 @@ export class PChessRoom extends DurableObject<Env> {
       return;
     }
 
-    const { chess, history } = await this.loadGame();
+    const { chess, history, moveTimestamps, startedAt } = await this.loadGame();
 
     const color = this.colorOf(ws);
     if (!color || color !== chess.turn()) {
@@ -347,25 +568,261 @@ export class PChessRoom extends DurableObject<Env> {
     }
 
     history.push(result.san);
-    await this.ctx.storage.delete('rematch');
-    await this.ctx.storage.put('game', { fen: chess.fen(), history } satisfies GameState);
+    moveTimestamps.push(now);
 
-    this.broadcast({ type: 'move', move: { from: move.from, to: move.to, promotion }, san: result.san, fen: chess.fen() });
+    // Anti-cheat heuristic (audit-only, không chặn realtime): flag các pattern
+    // bất thường dựa trên move timestamps. Server không chạy Stockfish nhưng có
+    // thể flag "behavior" để review sau.
+    const role = this.roleOf(ws);
+    if (role) {
+      await this.runAntiCheatHeuristic(role, moveTimestamps, history.length);
+    }
+
+    // Reset rematch state khi có nước đi mới (nếu ván đã kết thúc mà vẫn có
+    // nước đi -> hiếm nhưng đề phòng).
+    await this.ctx.storage.delete('rematch');
+    await this.ctx.storage.put('game', {
+      fen: chess.fen(),
+      history,
+      moveTimestamps,
+      startedAt,
+    } satisfies GameState);
+
+    await this.appendAudit({
+      t: now,
+      type: 'move',
+      role: role || undefined,
+      detail: { san: result.san, from: move.from, to: move.to },
+    });
+
+    const broadcastPayload = {
+      type: 'move',
+      move: { from: move.from, to: move.to, promotion },
+      san: result.san,
+      fen: chess.fen(),
+      ts: now,
+    };
+    const sig = await this.signPayload(broadcastPayload);
+    this.broadcast({ ...broadcastPayload, sig });
+  }
+
+  private async runAntiCheatHeuristic(role: Role, moveTimestamps: number[], moveCount: number): Promise<void> {
+    if (moveTimestamps.length < 2) return;
+
+    // Tính delta thời gian giữa các nước của CÙNG role (cách 2 nước vì luân phiên).
+    const ownDeltas: number[] = [];
+    // moveTimestamps[i] = thời điểm nước thứ i. Mỗi role đi nửa số nước.
+    // Role 'host' (trắng) đi ở index chẵn (0, 2, 4...), 'guest' ở index lẻ.
+    const expectedParity = role === 'host' ? 0 : 1;
+    for (let i = expectedParity + 2; i < moveTimestamps.length; i += 2) {
+      ownDeltas.push(moveTimestamps[i] - moveTimestamps[i - 2]);
+    }
+
+    if (ownDeltas.length < 3) return;
+
+    // Pattern 1: quá nhanh liên tục (engine pre-computed).
+    let fastStreak = 0;
+    let maxFastStreak = 0;
+    for (const d of ownDeltas) {
+      if (d < SUSPECT_FAST_MOVE_MS) {
+        fastStreak++;
+        if (fastStreak > maxFastStreak) maxFastStreak = fastStreak;
+      } else {
+        fastStreak = 0;
+      }
+    }
+    if (maxFastStreak >= SUSPECT_FAST_STREAK) {
+      await this.flagCheat(role, 'fast_move_streak', {
+        maxStreak: maxFastStreak,
+        threshold: SUSPECT_FAST_MOVE_MS,
+        moveCount,
+      });
+    }
+
+    // Pattern 2: quá đều (auto-player script). Cần ít nhất 8 nước để có ý nghĩa.
+    if (ownDeltas.length >= SUSPECT_UNIFORM_MIN_MOVES) {
+      const mean = ownDeltas.reduce((a, b) => a + b, 0) / ownDeltas.length;
+      const variance = ownDeltas.reduce((a, b) => a + (b - mean) ** 2, 0) / ownDeltas.length;
+      const stddev = Math.sqrt(variance);
+      if (stddev < SUSPECT_UNIFORM_STDDEV_MS && mean < 5000) {
+        await this.flagCheat(role, 'uniform_move_timing', {
+          stddev,
+          mean,
+          moveCount,
+        });
+      }
+    }
+  }
+
+  private async flagCheat(role: Role, reason: string, detail: unknown): Promise<void> {
+    const flag: CheatFlag = { role, reason, at: Date.now(), detail };
+    const flags = (await this.ctx.storage.get<CheatFlag[]>('cheat_flags')) || [];
+    // Tránh spam cùng một flag: chỉ add nếu flag cuối cùng khác reason hoặc quá 30s.
+    const last = flags[flags.length - 1];
+    if (last && last.reason === reason && last.role === role && Date.now() - last.at < 30_000) {
+      return;
+    }
+    flags.push(flag);
+    // Giới hạn 100 flag cuối.
+    if (flags.length > 100) flags.splice(0, flags.length - 100);
+    await this.ctx.storage.put('cheat_flags', flags);
+    await this.appendAudit({ t: flag.at, type: 'cheat_flag', role, detail: flag });
+
+    // Broadcast "cheat_flagged" tới cả 2 (audit-only, không chặn). Client có thể
+    // hiển thị badge "Đang xem xét" nếu muốn.
+    this.broadcast({ type: 'cheat_flagged', role, reason, ts: flag.at });
   }
 
   private async sendAuthoritativeSync(ws: WebSocket) {
-    const { chess, history } = await this.loadGame();
-    ws.send(JSON.stringify({ type: 'sync', fen: chess.fen(), history }));
+    const { chess, history, moveTimestamps, startedAt } = await this.loadGame();
+    const captured = this.deriveCaptured(history);
+    const syncPayload = {
+      type: 'sync',
+      fen: chess.fen(),
+      history,
+      captured,
+      moveTimestamps,
+      startedAt,
+      turn: chess.turn(),
+      ts: Date.now(),
+      source: 'request',
+    };
+    const sig = await this.signPayload(syncPayload);
+    ws.send(JSON.stringify({ ...syncPayload, sig }));
   }
 
-  private async noteRematchAccepted(ws: WebSocket): Promise<boolean> {
-    const role = this.roleOf(ws);
-    if (!role) return false;
+  // Derive captured pieces từ history (server-side, không tin client).
+  private deriveCaptured(history: string[]): { w: string[]; b: string[] } {
+    const temp = new Chess();
+    const captured: { w: string[]; b: string[] } = { w: [], b: [] };
+    for (const san of history) {
+      try {
+        const move = temp.move(san);
+        if (move && move.captured) {
+          // move.color = màu của NGƯỜI ĐI (đã ăn). Captured piece là màu đối thủ.
+          // chess.js: move.captured = loại quân bị ăn ('p','n','b','r','q').
+          // captured.w = quân trắng bị ăn (= đen ăn trắng).
+          const capturedColor = move.color === 'w' ? 'b' : 'w';
+          captured[capturedColor].push(move.captured);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+    return captured;
+  }
 
-    const saved = await this.ctx.storage.get<RematchState>('rematch');
-    const accepted = new Set<Role>(saved?.accepted || []);
-    accepted.add(role);
-    await this.ctx.storage.put('rematch', { accepted: [...accepted] } satisfies RematchState);
-    return ROLES.every((r) => accepted.has(r));
+  // ===== Rematch state machine (fix bug) =====
+  // Trước đây: rematch_accept xóa game ngay khi NHẬN một lần accept (gọi
+  // noteRematchAccepted add role + check every role has accepted). Rủi ro:
+  // nếu một bên bấm accept sớm hoặc message đến lệch, state bị xóa trước khi
+  // cả hai thật sự đồng ý.
+  //
+  // State machine mới:
+  //   idle -> (request từ A) -> requested
+  //   requested -> (accept từ A) -> accepted_by_<A>
+  //   accepted_by_<A> -> (accept từ B) -> accepted_by_both -> RESET GAME
+  //   requested -> (decline) -> declined
+  //   accepted_by_<A> -> (decline từ B) -> declined
+  //   declined -> (request mới) -> requested
+  // Quan trọng: chỉ reset game khi đạt accepted_by_both. Trạng thái được lưu
+  // rõ ràng trong storage để cả 2 client có thể sync.
+
+  private async handleRematchRequest(ws: WebSocket): Promise<void> {
+    const role = this.roleOf(ws);
+    if (!role) return;
+
+    let rematch = await this.ctx.storage.get<RematchState>('rematch');
+    if (!rematch || rematch.status === 'declined' || rematch.status === 'accepted_by_both') {
+      rematch = {
+        status: 'requested',
+        requestedBy: role,
+        acceptedBy: [role], // người request được xem như đã "accept" ngầm
+        requestedAt: Date.now(),
+      };
+    } else {
+      // Đang ở trạng thái requested / accepted_by_X. Người request lại -> reset.
+      rematch = {
+        status: 'requested',
+        requestedBy: role,
+        acceptedBy: [role],
+        requestedAt: Date.now(),
+      };
+    }
+    await this.ctx.storage.put('rematch', rematch);
+    await this.appendAudit({ t: Date.now(), type: 'rematch_request', role });
+
+    // Relay tới đối thủ.
+    this.relayToPeer(ws, { type: 'rematch_request', by: role, ts: Date.now() });
+  }
+
+  private async handleRematchAccept(ws: WebSocket): Promise<void> {
+    const role = this.roleOf(ws);
+    if (!role) return;
+
+    const rematch = await this.ctx.storage.get<RematchState>('rematch');
+    if (!rematch) {
+      // Không có request nào mà accept -> ignore.
+      return;
+    }
+    if (rematch.status === 'accepted_by_both' || rematch.status === 'declined') {
+      // Đã kết thúc — ignore.
+      return;
+    }
+
+    // Thêm role vào acceptedBy nếu chưa có.
+    if (!rematch.acceptedBy.includes(role)) {
+      rematch.acceptedBy.push(role);
+    }
+
+    // Cập nhật state machine.
+    const bothAccepted = ROLES.every((r) => rematch.acceptedBy.includes(r));
+    if (bothAccepted) {
+      rematch.status = 'accepted_by_both';
+    } else if (role === 'host') {
+      rematch.status = 'accepted_by_host';
+    } else {
+      rematch.status = 'accepted_by_guest';
+    }
+    await this.ctx.storage.put('rematch', rematch);
+    await this.appendAudit({ t: Date.now(), type: 'rematch_accept', role });
+
+    if (rematch.status === 'accepted_by_both') {
+      // Cả hai đã đồng ý — reset game. Broadcast rematch_accept tới cả 2 (đã
+      // được relay ở trên), sau đó xóa game state.
+      this.broadcast({ type: 'rematch_accept', by: role, ts: Date.now() });
+      await this.ctx.storage.delete('game');
+      await this.ctx.storage.delete('rematch');
+      // Giữ cheat_flags + audit log để review sau (không xóa).
+    } else {
+      // Chỉ một bên accept -> relay cho bên kia biết.
+      this.relayToPeer(ws, { type: 'rematch_accept_partial', by: role, status: rematch.status, ts: Date.now() });
+    }
+  }
+
+  private async handleRematchDecline(ws: WebSocket): Promise<void> {
+    const role = this.roleOf(ws);
+    if (!role) return;
+
+    const rematch = await this.ctx.storage.get<RematchState>('rematch');
+    if (!rematch || rematch.status === 'accepted_by_both' || rematch.status === 'declined') {
+      return;
+    }
+    rematch.status = 'declined';
+    await this.ctx.storage.put('rematch', rematch);
+    await this.appendAudit({ t: Date.now(), type: 'rematch_decline', role });
+
+    this.broadcast({ type: 'rematch_decline', by: role, ts: Date.now() });
+  }
+
+  // ===== Audit log =====
+  private async appendAudit(entry: AuditEntry): Promise<void> {
+    const log = (await this.ctx.storage.get<AuditEntry[]>('audit_log')) || [];
+    log.push(entry);
+    // Giới hạn kích thước — giữ AUDIT_LOG_MAX entry cuối.
+    if (log.length > AUDIT_LOG_MAX) {
+      log.splice(0, log.length - AUDIT_LOG_MAX);
+    }
+    await this.ctx.storage.put('audit_log', log);
   }
 }

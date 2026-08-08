@@ -133,6 +133,19 @@
                     </div>
                 </header>
 
+                <!-- Sync Banner (reconnect / restoring state) -->
+                <div id="sync-banner" class="sync-banner hidden">
+                    <span class="sync-spinner"></span>
+                    <span class="sync-text">Đang khôi phục ván cờ...</span>
+                </div>
+
+                <!-- Connection Banner (disconnect / takeover / room-full) -->
+                <div id="conn-banner" class="conn-banner hidden">
+                    <span class="conn-icon"></span>
+                    <span class="conn-text"></span>
+                    <span class="conn-detail"></span>
+                </div>
+
                 <!-- Main Game Area -->
                 <div class="game-main">
                     <!-- Opponent Info -->
@@ -147,9 +160,36 @@
                         <div class="player-timer" id="opponent-timer">--:--</div>
                     </div>
 
+                    <!-- Move indicators strip: last move / check / capture / promotion pending -->
+                    <div class="move-indicators" id="move-indicators">
+                        <span class="mi-chip mi-last" id="mi-last">
+                            <span class="mi-label">Nước vừa đi</span>
+                            <span class="mi-value">—</span>
+                        </span>
+                        <span class="mi-chip mi-check hidden" id="mi-check">
+                            <span class="mi-icon">⚠</span><span>Chiếu</span>
+                        </span>
+                        <span class="mi-chip mi-capture hidden" id="mi-capture">
+                            <span class="mi-icon">✕</span><span>Ăn quân</span>
+                        </span>
+                        <span class="mi-chip mi-promotion hidden" id="mi-promotion">
+                            <span class="mi-icon">↑</span><span>Đang chờ phong cấp</span>
+                        </span>
+                    </div>
+
                     <!-- Chess Board -->
                     <div class="board-container">
-                        <div id="chess-board" class="chess-board"></div>
+                        <div class="board-wrap">
+                            <div id="chess-board" class="chess-board"></div>
+                            <button id="btn-flip-board" class="btn btn-icon btn-flip" title="Lật bàn cờ">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="17 1 21 5 17 9"></polyline>
+                                    <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+                                    <polyline points="7 23 3 19 7 15"></polyline>
+                                    <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+                                </svg>
+                            </button>
+                        </div>
 
                         <!-- Promotion Modal -->
                         <div id="promotion-modal" class="modal promotion-modal hidden">
@@ -229,16 +269,23 @@
                     </div>
                 </div>
 
-                <!-- Side Panel -->
-                <aside class="game-panel">
-                    <div class="panel-section move-history">
+                <!-- Side Panel (tabs on mobile, sidebar on desktop) -->
+                <aside class="game-panel" id="game-panel">
+                    <!-- Mobile tab bar (hidden on desktop via CSS) -->
+                    <div class="panel-tabs" id="panel-tabs">
+                        <button class="panel-tab active" data-tab="move-history">Nước đi</button>
+                        <button class="panel-tab" data-tab="captured-pieces">Quân ăn</button>
+                        <button class="panel-tab" data-tab="connection-info">Kết nối</button>
+                        <button class="panel-tab panel-tab-collapse" id="panel-tab-collapse" title="Thu gọn">▼</button>
+                    </div>
+                    <div class="panel-section move-history active" data-section="move-history">
                         <h3>Lịch sử nước đi</h3>
                         <div class="move-list-container">
                             <div id="move-list" class="move-list"></div>
                         </div>
                     </div>
 
-                    <div class="panel-section captured-pieces">
+                    <div class="panel-section captured-pieces" data-section="captured-pieces">
                         <h3>Quân đã ăn</h3>
                         <div class="captured-container">
                             <div id="captured-by-self" class="captured-row"></div>
@@ -246,10 +293,29 @@
                         </div>
                     </div>
 
-                    <div class="panel-section connection-info">
+                    <div class="panel-section connection-info" data-section="connection-info">
+                        <h3>Trạng thái kết nối</h3>
                         <div class="connection-badge" id="connection-badge">
                             <span class="badge-dot"></span>
                             <span class="badge-text">Server</span>
+                        </div>
+                        <div class="conn-detail-list" id="conn-detail-list">
+                            <div class="conn-detail-row">
+                                <span class="conn-detail-label">Trạng thái</span>
+                                <span class="conn-detail-value" id="conn-detail-state">Đang kết nối...</span>
+                            </div>
+                            <div class="conn-detail-row">
+                                <span class="conn-detail-label">Ping</span>
+                                <span class="conn-detail-value" id="conn-detail-ping">—</span>
+                            </div>
+                            <div class="conn-detail-row">
+                                <span class="conn-detail-label">Mã phòng</span>
+                                <span class="conn-detail-value" id="conn-detail-room">—</span>
+                            </div>
+                            <div class="conn-detail-row">
+                                <span class="conn-detail-label">Vai trò</span>
+                                <span class="conn-detail-value" id="conn-detail-role">—</span>
+                            </div>
                         </div>
                     </div>
                 </aside>
@@ -435,6 +501,7 @@
                 </div>
                 <div class="analysis-actions">
                     <button id="btn-analysis-start" class="btn btn-primary">▶ Bắt đầu phân tích</button>
+                    <button id="btn-analysis-review" class="btn btn-secondary" title="Top 3 khoảnh khắc quyết định">⭐ Điểm ngoặt</button>
                     <button id="btn-analysis-pgn" class="btn btn-secondary">Nhập PGN</button>
                     <button id="btn-analysis-export" class="btn btn-secondary">Xuất PGN</button>
                 </div>
@@ -450,12 +517,28 @@
                         </div>
                     </div>
 
+                    <!-- Opening name + phase eval -->
+                    <div class="analysis-opening-row">
+                        <span id="analysis-opening-name" class="analysis-opening-name" title="Tên khai cuộc">Khai cuộc: —</span>
+                        <span id="analysis-phase" class="analysis-phase" title="Giai đoạn ván cờ">Giai đoạn: —</span>
+                    </div>
+
+                    <!-- Replay scrub bar -->
+                    <div class="analysis-scrub-wrap">
+                        <input type="range" id="analysis-scrub" class="analysis-scrub" min="0" max="0" value="0" step="1" />
+                        <span id="analysis-scrub-label" class="analysis-scrub-label">0 / 0</span>
+                    </div>
+
                     <div class="analysis-controls">
-                        <button id="btn-an-first" class="btn btn-icon" title="Về đầu">⏮</button>
-                        <button id="btn-an-prev" class="btn btn-icon" title="Nước trước">◀</button>
+                        <button id="btn-an-first" class="btn btn-icon" title="Về đầu (Home)">⏮</button>
+                        <button id="btn-an-prev" class="btn btn-icon" title="Nước trước (←)">◀</button>
+                        <button id="btn-an-play" class="btn btn-icon" title="Phát / dừng (Space)">▶</button>
+                        <button id="btn-an-next" class="btn btn-icon" title="Nước sau (→)">▶</button>
+                        <button id="btn-an-last" class="btn btn-icon" title="Đến cuối (End)">⏭</button>
                         <span id="analysis-position-label" class="analysis-pos-label">0/0</span>
-                        <button id="btn-an-next" class="btn btn-icon" title="Nước sau">▶</button>
-                        <button id="btn-an-last" class="btn btn-icon" title="Đến cuối">⏭</button>
+                        <button id="btn-an-flip" class="btn btn-icon" title="Lật bàn cờ">⇅</button>
+                        <button id="btn-an-undo" class="btn btn-icon" title="Lùi 1 nước (chế độ phân tích cục bộ)">↶</button>
+                        <button id="btn-an-why" class="btn btn-secondary" title="Giải thích nước này tại sao tốt/tệ">? Tại sao</button>
                     </div>
 
                     <div class="analysis-bestmove" id="analysis-bestmove">Chờ Stockfish phân tích...</div>
@@ -463,8 +546,12 @@
 
                 <aside class="analysis-panel">
                     <div class="panel-section">
-                        <h3>Biến tốt nhất</h3>
-                        <div id="analysis-pv" class="analysis-pv">—</div>
+                        <h3>3 đường tốt nhất (Multi-PV)</h3>
+                        <div id="analysis-multipv" class="analysis-multipv">—</div>
+                    </div>
+                    <div class="panel-section">
+                        <h3>Đánh giá theo giai đoạn</h3>
+                        <div id="analysis-phase-stats" class="analysis-phase-stats">—</div>
                     </div>
                     <div class="panel-section">
                         <h3>Thống kê phân loại</h3>
@@ -478,7 +565,7 @@
                         </div>
                     </div>
                     <div class="panel-section">
-                        <h3>Nước đi & Đánh giá</h3>
+                        <h3>Nước đi &amp; Đánh giá</h3>
                         <div id="analysis-movelist" class="analysis-movelist"></div>
                     </div>
                     <div class="panel-section">
@@ -487,6 +574,33 @@
                     </div>
                 </aside>
             </div>
+        </div>
+
+        <!-- Review Mode Modal (top 3 turning points) -->
+        <div id="review-modal" class="modal hidden">
+            <div class="modal-overlay"></div>
+            <div class="modal-content review-content">
+                <div class="modal-header">
+                    <h2>⭐ Điểm ngoặt ván cờ</h2>
+                    <button class="btn btn-icon btn-close-modal">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+                <p class="review-intro">Top 3 khoảnh khắc quyết định kết quả ván cờ (dựa trên độ rớt % thắng lớn nhất).</p>
+                <div id="review-list" class="review-list">Chưa có dữ liệu — hãy bấm "Bắt đầu phân tích".</div>
+            </div>
+        </div>
+
+        <!-- "Why this is bad" popup -->
+        <div id="why-popup" class="why-popup hidden">
+            <div class="why-header">
+                <span class="why-title">Giải thích nước đi</span>
+                <button id="btn-why-close" class="btn btn-icon" title="Đóng">✕</button>
+            </div>
+            <div id="why-body" class="why-body">—</div>
         </div>
 
         <!-- Toast Container -->
