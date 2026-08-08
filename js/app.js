@@ -460,47 +460,11 @@ class PChessGame {
             this.settings.timer = parseInt(e.target.value);
             this.saveSettings();
         });
-        document.getElementById('setting-engine').addEventListener('change', (e) => {
-            this.settings.engine = e.target.value;
-            this.saveSettings();
-        });
-        document.getElementById('btn-import-engine').addEventListener('click', () => {
-            document.getElementById('engine-file-input').click();
-        });
-        document.getElementById('engine-file-input').addEventListener('change', async (e) => {
-            const files = e.target.files ? Array.from(e.target.files) : [];
-            e.target.value = '';
-            if (!files.length) return;
-            const js = files.find(f => /\.js$/i.test(f.name));
-            const wasm = files.find(f => /\.wasm$/i.test(f.name));
-            if (!js && !wasm) {
-                showToast('Hãy chọn file .js và .wasm của bản Full', 'warning');
-                return;
-            }
-            showToast('Đang lưu bản Full...', 'info');
-            try {
-                if (js) await EngineStore.save('engine-full', js);
-                if (wasm) await EngineStore.save('engine-full-wasm', wasm);
-                await this.syncEngineStatus();
-                const missing = [];
-                if (!js) missing.push('.js');
-                if (!wasm) missing.push('.wasm');
-                showToast('Đã lưu bản Full' + (missing.length ? ' (thiếu ' + missing.join(', ') + ')' : ''), missing.length ? 'warning' : 'success');
-            } catch (err) {
-                showToast('Lưu thất bại: ' + (err && err.message ? err.message : err), 'error');
-            }
-        });
-        document.getElementById('btn-clear-engine').addEventListener('click', async () => {
-            try {
-                await EngineStore.delete('engine-full');
-                await EngineStore.delete('engine-full-wasm');
-                await this.syncEngineStatus();
-                showToast('Đã xóa bản Full', 'success');
-            } catch (err) {
-                showToast('Xóa thất bại: ' + (err && err.message ? err.message : err), 'error');
-            }
-        });
-        document.getElementById('btn-download-engine').addEventListener('click', () => this.downloadFullEngine());
+        // Engine settings đã bỏ (analysis chạy server-side qua Lichess API).
+        // Các element setting-engine, btn-import-engine, btn-clear-engine,
+        // btn-download-engine, engine-file-input đã bị xóa khỏi HTML nên không
+        // bind events nữa — dùng null-safe check để backward compat với cache
+        // cũ (trình duyệt có thể vẫn còn HTML cũ).
 
         // Promotion modal
         document.querySelectorAll('.promotion-piece').forEach(btn => {
@@ -561,12 +525,15 @@ class PChessGame {
         document.getElementById('setting-animation').checked = this.settings.animation;
         document.getElementById('setting-coords').checked = this.settings.coords;
         document.getElementById('setting-timer').value = this.settings.timer;
-        document.getElementById('setting-engine').value = this.settings.engine || 'lite';
+        // setting-engine đã bỏ (analysis server-side). Null-safe để tránh crash
+        // nếu trình duyệt còn cache HTML cũ.
+        const engineSelect = document.getElementById('setting-engine');
+        if (engineSelect) engineSelect.value = this.settings.engine || 'lite';
         document.querySelectorAll('.theme-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.theme === this.settings.theme);
         });
         this.soundManager.setEnabled(this.settings.sound);
-        this.syncEngineStatus();
+        // syncEngineStatus đã bỏ (không còn EngineStore UI)
     }
 
     async syncEngineStatus() {
