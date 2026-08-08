@@ -518,19 +518,6 @@ class PChessGame {
         if (dlBtn) {
             dlBtn.addEventListener('click', () => this.downloadFullEngine());
         }
-        // Lichess token — cho Opening Explorer
-        const lichessToken = document.getElementById('setting-lichess-token');
-        if (lichessToken) {
-            lichessToken.addEventListener('change', (e) => {
-                this.settings.lichessToken = e.target.value.trim();
-                this.saveSettings();
-                // Reset explorer cache + disabled flag để thử lại với token mới
-                if (window.Analysis) {
-                    Analysis._explorerCache = {};
-                    Analysis._explorerDisabled = false;
-                }
-            });
-        }
 
         // Promotion modal
         document.querySelectorAll('.promotion-piece').forEach(btn => {
@@ -592,9 +579,7 @@ class PChessGame {
         document.getElementById('setting-coords').checked = this.settings.coords;
         document.getElementById('setting-timer').value = this.settings.timer;
         const engineSelect = document.getElementById('setting-engine');
-        if (engineSelect) engineSelect.value = this.settings.engine || 'server';
-        const lichessToken = document.getElementById('setting-lichess-token');
-        if (lichessToken) lichessToken.value = this.settings.lichessToken || '';
+        if (engineSelect) engineSelect.value = this.settings.engine === 'full' ? 'full' : 'lite';
         document.querySelectorAll('.theme-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.theme === this.settings.theme);
         });
@@ -605,8 +590,8 @@ class PChessGame {
 
     updateEngineSectionVisibility() {
         const section = document.getElementById('engine-local-section');
-        const mode = this.settings.engine || 'server';
-        if (section) section.style.display = (mode === 'lite' || mode === 'full') ? 'block' : 'none';
+        const mode = this.settings.engine === 'full' ? 'full' : 'lite';
+        if (section) section.style.display = 'block';
     }
 
     async syncEngineStatus() {
@@ -2252,16 +2237,15 @@ class PChessGame {
             animation: true,
             coords: false,
             timer: 0,
-            engine: 'server',
-            lichessToken: ''
+            engine: 'lite'
         };
 
         try {
             const saved = localStorage.getItem('pchess_settings');
             if (saved) {
                 const parsed = JSON.parse(saved);
-                // Migration: 'auto' engine không còn dùng → 'server'
-                if (parsed.engine === 'auto' || !parsed.engine) parsed.engine = 'server';
+                // Migration: 'server'/'auto' engine không còn dùng → 'lite'
+                if (parsed.engine === 'server' || parsed.engine === 'auto' || !parsed.engine) parsed.engine = 'lite';
                 return { ...defaults, ...parsed };
             }
         } catch (e) {
@@ -2639,8 +2623,6 @@ const Analysis = {
     MULTI_PV_COUNT: 3,
     _watchdogTimer: null,
     _heartbeatTimer: null,
-    _forceLite: false,
-    _fallbackTried: false,
 
     init() {
         document.getElementById('btn-analysis-back').addEventListener('click', () => this.exit());
@@ -2691,7 +2673,8 @@ const Analysis = {
         this.index = -1;
         this.failed = false;
         this.pendingStartAfterReady = false;
-        this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi PGN lên server.');
+        this.setEngineStatus('Đang tải Stockfish...');
+        this.ensureEngine();
         this.goTo(0);
     },
 
@@ -2716,7 +2699,8 @@ const Analysis = {
             this.pendingStartAfterReady = false;
             document.getElementById('pgn-modal').classList.add('hidden');
             document.getElementById('pgn-input').value = '';
-            this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi PGN lên server.');
+            this.setEngineStatus('Đang tải Stockfish...');
+            this.ensureEngine();
             this.goTo(0);
             this.show();
             showToast('Đã nạp PGN: ' + moves.length + ' nước', 'success');
@@ -2738,29 +2722,19 @@ const Analysis = {
         } else {
             document.getElementById('landing-page').classList.add('active');
         }
-        // Hủy request đang chạy nếu user exit giữa chừng
-        this._abortRequest();
+        this.stopEngine();
     },
 
-    // ===== Engine mode dispatcher =====
-    // 3 mode: 'server' (Lichess API), 'lite' (Stockfish local lite),
-    // 'full' (Stockfish local full). Default 'server'.
+    // ===== Engine mode: chỉ có 'lite' và 'full' =====
     getEngineMode() {
         const g = window.game;
-        if (!g || !g.settings) return 'server';
-        return g.settings.engine || 'server';
+        if (!g || !g.settings) return 'lite';
+        return g.settings.engine === 'full' ? 'full' : 'lite';
     },
 
     ensureEngine() {
-        // Chỉ cần cho local mode (lite/full). Server mode không cần engine.
-        const mode = this.getEngineMode();
-        if (mode === 'server') {
-            this.ready = true;
-            this.setEngineStatus('Sẵn sàng — bấm "Bắt đầu phân tích" để gửi lên server.');
-            return;
-        }
-        // Local mode: cần Worker
         if (this.engine || this.failed) return;
+        const mode = this.getEngineMode();
         this.setEngineStatus('Đang tải Stockfish ' + mode + '...');
         const gen = ++this._gen;
         this._engineMode = mode;
@@ -2773,12 +2747,12 @@ const Analysis = {
                 this.engine = new Worker(res.url);
                 this.engineUrlValue = res.revokeUrl;
             } catch (err) {
-                this._tryFallback('Không tạo được worker: ' + err.message, gen);
+                this.engineFailed('Không tạo được worker: ' + err.message);
                 return;
             }
             this.engine.onerror = (e) => {
                 const msg = e.message || (e.filename ? ('tại ' + e.filename.split('/').pop() + ':' + e.lineno) : 'worker error');
-                this._tryFallback('Stockfish lỗi: ' + msg, gen);
+                this.engineFailed('Stockfish lỗi: ' + msg);
                 return;
             };
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
@@ -2797,42 +2771,17 @@ const Analysis = {
             this._watchdogTimer = setTimeout(() => {
                 if (gen !== this._gen) return;
                 if (!this.ready && !this.failed) {
-                    this._tryFallback('Stockfish không phản hồi sau ' + (timeout / 1000) + 's', gen);
+                    this.engineFailed('Stockfish không phản hồi sau ' + (timeout / 1000) + 's');
                 }
             }, timeout);
         }).catch((err) => {
             if (gen !== this._gen) return;
-            this._tryFallback(err && err.message ? err.message : 'Không tải được engine', gen);
+            this.engineFailed(err && err.message ? err.message : 'Không tải được engine');
         });
     },
 
-    // Fallback: nếu local fail (timeout/error), thử server mode.
-    _tryFallback(reason, gen) {
-        if (this.engine) {
-            try { this.engine.terminate(); } catch (e) { /* ignore */ }
-            this.engine = null;
-        }
-        this.revokeEngineUrls();
-        if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
-
-        // Nếu đang local mode và chưa fallback, thử server
-        if (this._engineMode !== 'server' && !this._fallbackTried) {
-            this._fallbackTried = true;
-            debugLog('warn', 'Stockfish local thất bại:', reason, '— thử server mode');
-            this.setEngineStatus('Local thất bại (' + reason + '). Đang thử server mode...');
-            // Force server mode cho session này
-            this._forceServer = true;
-            this._engineMode = 'server';
-            this.ready = true;
-            return;
-        }
-        this.engineFailed(reason + (this._fallbackTried ? ' (đã thử server cũng fail)' : ''));
-    },
-
     engineUrl() {
-        const mode = this._forceServer ? 'server' : (this._engineMode || this.getEngineMode());
-        if (mode === 'server') return Promise.resolve({ url: '', revokeUrl: null });
+        const mode = this._engineMode || this.getEngineMode();
         if (mode === 'lite') {
             return Promise.resolve({ url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null });
         }
@@ -2917,12 +2866,9 @@ const Analysis = {
             } catch (e) { /* ignore */ }
             this.engine = null;
         }
-        this._abortRequest();
         this.revokeEngineUrls();
         this.ready = false;
         this.failed = false;
-        this._forceServer = false;
-        this._fallbackTried = false;
         if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
         if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.pendingPly = null;
@@ -2931,18 +2877,7 @@ const Analysis = {
         this._gen++;
     },
 
-    _abortRequest() {
-        if (this._abortController) {
-            try { this._abortController.abort(); } catch (e) { /* ignore */ }
-            this._abortController = null;
-        }
-        if (this._progressTimer) {
-            clearInterval(this._progressTimer);
-            this._progressTimer = null;
-        }
-    },
-
-    // ===== Start full analysis — dispatcher theo mode =====
+    // ===== Start full analysis (local Stockfish) =====
     startFullAnalysis() {
         if (!this.pgnMoves.length) {
             showToast('Chưa có ván cờ nào để phân tích', 'warning');
@@ -2952,190 +2887,35 @@ const Analysis = {
             showToast('Đang phân tích...', 'info');
             return;
         }
-        const mode = this.getEngineMode();
-        // Server mode hoặc engine local chưa sẵn sàng → dùng server (fallback)
-        if (mode === 'server' || this._forceServer || !this.ready || !this.engine) {
-            if (mode !== 'server' && !this._forceServer) {
-                debugLog('warn', 'startFullAnalysis: local engine not ready, fallback to server');
-                this._forceServer = true;
-            }
-            this._runServerAnalysis();
-        } else {
-            // Local mode (lite/full) với engine đã ready
-            this.analyzeAll();
-        }
-    },
-
-    // ===== Server-side analysis (Lichess Cloud Eval API) =====
-    async _runServerAnalysis() {
-        this._abortRequest();
-        this._abortController = new AbortController();
-        const gen = this._gen;
-        const totalPlys = this.pgnMoves.length + 1;
-
-        let elapsed = 0;
-        this._progressTimer = setInterval(() => {
-            if (gen !== this._gen) return;
-            elapsed++;
-            const eta = Math.ceil(totalPlys / 5 - elapsed);
-            this.setEngineStatus(`Đang phân tích trên server (Lichess API) — đã ${elapsed}s, ước tính ~${Math.max(0,eta)}s còn lại...`);
-        }, 1000);
-
-        this.setEngineStatus('Đang gửi PGN lên server...');
-        this.batchQueue = [0];
-
-        try {
-            const resp = await fetch('/api/analyze', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ moves: this.pgnMoves }),
-                signal: this._abortController.signal,
-            });
-
-            if (gen !== this._gen) return;
-            if (!resp.ok) {
-                const err = await resp.json().catch(() => ({}));
-                throw new Error(err.message || 'HTTP ' + resp.status);
-            }
-
-            const data = await resp.json();
-            if (gen !== this._gen) return;
-
-            for (const pos of data.positions) {
-                if (pos.error) continue;
-                if (pos.eval && pos.eval.score) {
-                    this.evals[pos.ply] = {
-                        score: { type: pos.eval.score.type, value: pos.eval.score.value },
-                        pv: pos.eval.pv || [],
-                        depth: pos.eval.depth || 0,
-                        multipv: (pos.multipv || []).map(m => ({
-                            score: { type: m.score.type, value: m.score.value },
-                            pv: m.pv || [],
-                            depth: m.depth || 0
-                        }))
-                    };
-                }
-                if (pos.opening && pos.opening.name) {
-                    if (!this._openingCache) this._openingCache = {};
-                    this._openingCache[pos.ply] = pos.opening;
-                }
-            }
-
-            this.batchQueue = null;
-            this.classify();
-            this.renderMoveList();
-            this.goTo(this.index < 0 ? 0 : this.index);
-            this.renderPhaseStats();
-
-            const okCount = (data.positions || []).filter(p => !p.error).length;
-            const errCount = (data.positions || []).filter(p => p.error).length;
-            if (errCount > 0 && okCount === 0) {
-                this.setEngineStatus(`⚠️ Lichess API không khả dụng (${errCount} positions fail)`, true);
-                showToast('Phân tích thất bại', 'error');
-            } else if (errCount > 0) {
-                this.setEngineStatus(`Đã phân tích xong ${okCount}/${data.positions.length} positions`);
-                showToast(`Đã phân tích xong (${okCount}/${data.positions.length})`, 'success');
-            } else {
-                this.setEngineStatus(`Đã phân tích xong toàn bộ ván (${okCount} positions, depth 60-75)`);
-                showToast('Đã phân tích xong toàn bộ ván', 'success');
-            }
-        } catch (err) {
-            if (gen !== this._gen) return;
-            if (err.name === 'AbortError') {
-                this.batchQueue = null;
-                this.setEngineStatus('Đã hủy phân tích.');
-                return;
-            }
-            this.batchQueue = null;
-            this.setEngineStatus('⚠️ Lỗi: ' + (err.message || err), true);
-            showToast('Phân tích thất bại: ' + (err.message || err), 'error');
-        } finally {
-            if (this._progressTimer) {
-                clearInterval(this._progressTimer);
-                this._progressTimer = null;
-            }
-        }
-    },
-
-    // ===== analyzeCurrent — dispatcher theo mode =====
-    analyzeCurrent() {
-        const mode = this.getEngineMode();
-        if (mode === 'server' || this._forceServer) {
-            this._analyzeCurrentServer();
-        } else {
-            // Local mode: phải có engine, không có thì fallback server
-            if (!this.engine || !this.ready) {
-                debugLog('warn', 'analyzeCurrent: engine not ready, fallback to server mode');
-                this._forceServer = true;
-                this._analyzeCurrentServer();
-                return;
-            }
-            this._analyzeCurrentLocal();
-        }
-    },
-
-    async _analyzeCurrentServer() {
-        if (this.index < 0 || this.index > this.pgnMoves.length) return;
-        if (this.evals[this.index]) {
-            this.renderEval(this.index);
-            this.renderMultiPV(this.index);
-            this.renderOpeningExplorer(this.index);
+        if (this.failed) {
+            showToast('Stockfish không hoạt động, thử lại sau', 'warning');
             return;
         }
-        if (this.pendingPly != null) return;
-        this.pendingPly = this.index;
-        this.setEngineStatus('Đang phân tích position ' + this.index + ' trên server...');
-
-        try {
-            const resp = await fetch('/api/analyze', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ moves: this.pgnMoves.slice(0, this.index) }),
-            });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const data = await resp.json();
-            const pos = data.positions && data.positions[data.positions.length - 1];
-            if (pos && !pos.error && pos.eval) {
-                this.evals[pos.ply] = {
-                    score: { type: pos.eval.score.type, value: pos.eval.score.value },
-                    pv: pos.eval.pv || [],
-                    depth: pos.eval.depth || 0,
-                    multipv: (pos.multipv || []).map(m => ({
-                        score: { type: m.score.type, value: m.score.value },
-                        pv: m.pv || [],
-                        depth: m.depth || 0
-                    }))
-                };
-                if (pos.opening) {
-                    if (!this._openingCache) this._openingCache = {};
-                    this._openingCache[pos.ply] = pos.opening;
-                }
-                this.renderEval(pos.ply);
-                this.renderMultiPV(pos.ply);
-                this.renderOpeningName(pos.ply);
-                this.setEngineStatus('Đã phân tích position ' + pos.ply + ' (depth ~' + (pos.eval.depth || '?') + ')');
-            } else {
-                this.setEngineStatus('⚠️ Lichess API không trả về được position này', true);
+        if (!this.ready) {
+            if (!this.engine) {
+                this.ensureEngine();
             }
-        } catch (err) {
-            this.setEngineStatus('⚠️ Lỗi: ' + (err.message || err), true);
-        } finally {
-            this.pendingPly = null;
+            this.pendingStartAfterReady = true;
+            return;
         }
+        this.analyzeAll();
     },
 
-    _analyzeCurrentLocal() {
+    // ===== analyzeCurrent (local Stockfish) =====
+    analyzeCurrent() {
         if (!this.ready || this.index < 0 || this.index > this.pgnMoves.length) return;
         if (!this.engine) {
             this.setEngineStatus('⚠️ Engine chưa khởi tạo', true);
             return;
         }
+        // Stockfish -single crash nếu gửi position/go khi đang search → phải chờ bestmove.
         if (this.pendingPly != null) {
             this.requestPly = this.index;
             return;
         }
         this.pendingPly = this.index;
         this.requestPly = null;
+        // Stockfish cần UCI (e2e4), chuyển từ SAN
         const ucis = [];
         const ch = new Chess();
         for (let i = 0; i < this.index; i++) {
@@ -3151,7 +2931,7 @@ const Analysis = {
             (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
     },
 
-    // ===== Local engine message handler (cho lite/full mode) =====
+    // ===== Local engine message handler =====
     onEngineMessage(data) {
         if (typeof data !== 'string') return;
         if (this._heartbeatTimer) {
@@ -3214,41 +2994,6 @@ const Analysis = {
         }
     },
 
-    // ===== Helpers để convert UCI → SAN (cho local engine mode) =====
-    parseScore(line) {
-        const m = line.match(/score (cp|mate) (-?\d+)/);
-        if (!m) return null;
-        if (m[1] === 'mate') {
-            const moves = parseInt(m[2], 10);
-            return { type: 'mate', value: moves };
-        }
-        return { type: 'cp', value: parseInt(m[2], 10) };
-    },
-
-    parseDepth(line) {
-        const m = line.match(/depth (\d+)/);
-        return m ? parseInt(m[1], 10) : null;
-    },
-
-    parsePv(line, ply) {
-        const m = line.match(/ pv (.+)$/);
-        if (!m) return [];
-        const ucis = m[1].trim().split(/\s+/);
-        const ch = new Chess();
-        try {
-            for (let i = 0; i < ply; i++) ch.move(this.pgnMoves[i]);
-        } catch (e) { /* ignore */ }
-        const sans = [];
-        for (const u of ucis) {
-            if (u.length < 4) break;
-            try {
-                const mv = ch.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u.length > 4 ? u[4] : undefined });
-                if (mv) sans.push(mv.san);
-                else break;
-            } catch (e) { break; }
-        }
-        return sans;
-    },
 
     // ===== Local batch analysis (cho lite/full mode) =====
     analyzeAll() {
@@ -3321,8 +3066,6 @@ const Analysis = {
             this.renderEval(idx);
             this.renderMultiPV(idx);
         }
-        // Render opening explorer (luôn gọi — async fetch, cache)
-        this.renderOpeningExplorer(idx);
         this.renderPhaseStats();
     },
 
@@ -3387,150 +3130,6 @@ const Analysis = {
         } else {
             el.textContent = 'Khai cuộc: Không xác định / biến phụ';
             el.title = '';
-        }
-    },
-
-    // ===== Opening Explorer (client-side direct call to Lichess) =====
-    // Lichess explorer API (explorer.lichess.ovh) hiện yêu cầu token (401).
-    // Ẩn panel nếu không có token, tránh spam lỗi 401 trong console.
-    async renderOpeningExplorer(idx) {
-        const container = document.getElementById('analysis-opening-explorer');
-        if (!container) return;
-        const fen = this.posChess.fen();
-        const cacheKey = 'explorer_' + fen;
-
-        if (!this._explorerCache) this._explorerCache = {};
-
-        // Check 1 lần xem explorer có hoạt động không. Nếu 401 thì ẩn panel.
-        if (this._explorerDisabled) {
-            container.innerHTML = '<div class="explorer-empty">Opening Explorer cần Lichess API token (hiện không có). Vào <a href="https://lichess.org/account/api/token" target="_blank">lichess.org</a> để tạo token.</div>';
-            return;
-        }
-
-        if (!this._explorerCache[cacheKey]) {
-            this._explorerCache[cacheKey] = 'loading';
-            container.innerHTML = '<div class="explorer-loading">Đang tải dữ liệu khai cuộc...</div>';
-
-            try {
-                const [masters, community] = await Promise.all([
-                    this._fetchExplorer(fen, 'masters'),
-                    this._fetchExplorer(fen, 'lichess'),
-                ]);
-                const data = { masters, community };
-                this._explorerCache[cacheKey] = data;
-                this._renderExplorerData(container, data);
-            } catch (err) {
-                const msg = (err && err.message) || String(err);
-                if (msg.indexOf('401') !== -1) {
-                    this._explorerDisabled = true;
-                    container.innerHTML = '<div class="explorer-empty">Opening Explorer cần Lichess API token. <a href="https://lichess.org/account/api/token" target="_blank">Tạo token</a> rồi thêm vào Settings.</div>';
-                } else {
-                    this._explorerCache[cacheKey] = { error: msg };
-                    container.innerHTML = '<div class="explorer-error">Lỗi: ' + msg + '</div>';
-                }
-            }
-            return;
-        }
-
-        const cached = this._explorerCache[cacheKey];
-        if (cached === 'loading') {
-            container.innerHTML = '<div class="explorer-loading">Đang tải...</div>';
-        } else if (cached.error) {
-            container.innerHTML = '<div class="explorer-error">Lỗi: ' + cached.error + '</div>';
-        } else {
-            this._renderExplorerData(container, cached);
-        }
-    },
-
-    async _fetchExplorer(fen, type) {
-        const url = type === 'masters'
-            ? `https://explorer.lichess.ovh/masters?fen=${encodeURIComponent(fen)}`
-            : `https://explorer.lichess.ovh/lichess?fen=${encodeURIComponent(fen)}&speeds[]=blitz&speeds[]=rapid&speeds[]=classical`;
-        const headers = { 'Accept': 'application/json' };
-        // Lichess explorer giờ yêu cầu API token (401 nếu không có)
-        const g = window.game;
-        const token = g && g.settings && g.settings.lichessToken;
-        if (token) {
-            headers['Authorization'] = 'Bearer ' + token;
-        }
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const data = await resp.json();
-        return {
-            moves: (data.moves || []).slice(0, 12).map(m => ({
-                uci: m.uci,
-                san: m.san,
-                totalGames: m.white + m.black + m.draws,
-                whiteWins: m.white,
-                blackWins: m.black,
-                draws: m.draws,
-            })),
-            totalGames: (data.white || 0) + (data.black || 0) + (data.draws || 0),
-            opening: data.opening,
-        };
-    },
-
-    _renderExplorerData(container, data) {
-        if (!data || (!data.masters && !data.community)) {
-            container.innerHTML = '<div class="explorer-empty">Không có dữ liệu khai cuộc cho vị trí này</div>';
-            return;
-        }
-        let html = '';
-
-        // Masters games
-        if (data.masters && data.masters.moves && data.masters.moves.length) {
-            html += '<div class="explorer-section"><h4>Master Games</h4>';
-            html += '<div class="explorer-meta">' + (data.masters.totalGames || 0).toLocaleString() + ' ván master</div>';
-            html += '<table class="explorer-table"><tbody>';
-            for (const m of data.masters.moves.slice(0, 8)) {
-                const pct = m.totalGames > 0 ? (m.whiteWins + m.blackWins + m.draws) * 100 / m.totalGames : 0;
-                const whitePct = m.totalGames > 0 ? (m.whiteWins * 100 / m.totalGames).toFixed(0) : 0;
-                const drawPct = m.totalGames > 0 ? (m.draws * 100 / m.totalGames).toFixed(0) : 0;
-                const blackPct = m.totalGames > 0 ? (m.blackWins * 100 / m.totalGames).toFixed(0) : 0;
-                html += `<tr><td class="ex-move">${this._sanOfUci(m.uci)}</td>` +
-                    `<td class="ex-games">${m.totalGames.toLocaleString()}</td>` +
-                    `<td class="ex-stats"><span class="ex-w">${whitePct}%</span> <span class="ex-d">${drawPct}%</span> <span class="ex-b">${blackPct}%</span></td></tr>`;
-            }
-            html += '</tbody></table></div>';
-        }
-
-        // Community games
-        if (data.community && data.community.moves && data.community.moves.length) {
-            html += '<div class="explorer-section"><h4>Community Games</h4>';
-            html += '<div class="explorer-meta">' + (data.community.totalGames || 0).toLocaleString() + ' ván</div>';
-            html += '<table class="explorer-table"><tbody>';
-            for (const m of data.community.moves.slice(0, 8)) {
-                const whitePct = m.totalGames > 0 ? (m.whiteWins * 100 / m.totalGames).toFixed(0) : 0;
-                const drawPct = m.totalGames > 0 ? (m.draws * 100 / m.totalGames).toFixed(0) : 0;
-                const blackPct = m.totalGames > 0 ? (m.blackWins * 100 / m.totalGames).toFixed(0) : 0;
-                html += `<tr><td class="ex-move">${this._sanOfUci(m.uci)}</td>` +
-                    `<td class="ex-games">${m.totalGames.toLocaleString()}</td>` +
-                    `<td class="ex-stats"><span class="ex-w">${whitePct}%</span> <span class="ex-d">${drawPct}%</span> <span class="ex-b">${blackPct}%</span></td></tr>`;
-            }
-            html += '</tbody></table></div>';
-        }
-
-        if (!html) {
-            container.innerHTML = '<div class="explorer-empty">Không có dữ liệu khai cuộc cho vị trí này</div>';
-            return;
-        }
-        container.innerHTML = html;
-    },
-
-    // Convert UCI move (e2e4) sang SAN bằng cách replay từ vị trí hiện tại
-    _sanOfUci(uci) {
-        if (!uci || uci.length < 4) return uci || '';
-        try {
-            const ch = new Chess();
-            ch.load(this.posChess.fen());
-            const mv = ch.move({
-                from: uci.slice(0, 2),
-                to: uci.slice(2, 4),
-                promotion: uci.length > 4 ? uci[4] : undefined,
-            });
-            return mv ? mv.san : uci;
-        } catch (e) {
-            return uci;
         }
     },
 
@@ -3833,6 +3432,21 @@ const Analysis = {
         return ch;
     },
 
+    // ===== Classification theo Lichess lila algorithm (canonical) =====
+    // Reference: lila/modules/analyse/src/eval/Advantage.scala + Score.scala
+    // Lila dùng sigmoid win% với constant 0.00368208 (Lichess standard).
+    // Accuracy: 103.1668 * exp(-0.04354 * (winBefore - winBest)) - 3.1669, clamp [0,100]
+    // Labels dựa trên win% drop (delta = winBefore - winAfter):
+    //   - Book: <=10 ply, near opening
+    //   - Brilliant: isBest + sacrifice + winAfter tốt
+    //   - Great: isBest + rescue
+    //   - Best: đúng top PV
+    //   - Excellent: delta <= 0.5
+    //   - Good: delta <= 2
+    //   - Inaccuracy: delta <= 5
+    //   - Mistake: delta <= 10
+    //   - Blunder: delta > 10
+    //   - Missed: bỏ lỡ mate/win rõ ràng
     classifyMove(i) {
         const before = this.evals[i - 1];
         const after = this.evals[i];
@@ -3850,59 +3464,48 @@ const Analysis = {
         const playedSan = this.pgnMoves[i - 1];
         const isBest = !!bestSan && bestSan === playedSan;
 
-        // ===== Chess.com-style classification (improved) =====
-        // Reference: chess.com's "Move Quality" algorithm (reverse-engineered)
-        // Sử dụng delta win% + material context + alternative moves từ MultiPV.
-
         // Book: nước đầu (<=10 ply) gần đúng khai cuộc
         if (i <= this.BOOK_PLY && delta <= 5) return { label: 'Book', delta, winBefore, winAfter };
 
-        // Lấy top 2 từ multiPV để check "alternative good moves"
-        const alts = (before.multipv || []).slice(0, 3);
-        const altCps = alts.map(a => this.cpOf(a.score)).filter(c => c != null);
-        const secondBestCp = altCps.length > 1 ? altCps[1] : null;
-        const altBestIsMate = alts.length > 1 && alts[1].score && alts[1].score.type === 'mate';
-
-        // ===== Brilliant (!!): sacrifice material nhưng vẫn thắng mạnh =====
-        // Chess.com: chỉ đánh Brilliant khi:
-        // - Nước đi là best move (top PV)
-        // - Có hy sinh material (mất >= 1.5 pawns)
-        // - Vẫn giữ được lợi thế (winAfter >= 60% hoặc forced mate)
+        // ===== Brilliant (!!): sacrifice material + isBest + winAfter tốt =====
+        // Lila: chỉ đánh Brilliant khi nước đi là best, có hy sinh material,
+        // và sau nước đó vẫn giữ lợi thế (winAfter >= 50 hoặc forced mate).
         if (isBest && winAfter >= 50) {
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
             const matLost = bal0 - bal1;
+            // Hy sinh >= 1.5 pawns + vẫn thắng (winAfter >= 60 hoặc mate)
             if (matLost >= 1.5 && (winAfter >= 60 || (after.score && after.score.type === 'mate' && after.score.value > 0))) {
                 return { label: 'Brilliant', delta, winBefore, winAfter };
             }
         }
 
         // ===== Great (!): rescue từ thế khó → cầm cờ/thắng =====
-        // Chess.com: delta <= 3 + chuyển thế thua thành thắng/cầm cờ
-        if (delta <= 3 && ((winBefore <= 30 && winAfter >= 50) || (winBefore <= 50 && winAfter >= 75))) {
+        // Lila: delta rất nhỏ + chuyển thế thua thành thắng/cầm cờ
+        if (delta <= 2 && ((winBefore <= 30 && winAfter >= 50) || (winBefore <= 50 && winAfter >= 75))) {
             return { label: 'Great', delta, winBefore, winAfter };
         }
 
         // ===== Best: đúng nước engine đề xuất =====
         if (isBest) return { label: 'Best', delta, winBefore, winAfter };
 
-        // ===== Excellent: rất gần best (delta <= 5) =====
-        if (delta <= 5) return { label: 'Excellent', delta, winBefore, winAfter };
+        // ===== Missed: bỏ lỡ cơ hội thắng rõ ràng =====
+        // Lila: khi winBefore >= 80 (đang thắng lớn) nhưng delta >= 5
+        if (delta >= 5 && winBefore >= 80) return { label: 'Missed', delta, winBefore, winAfter };
 
-        // ===== Good: khá tốt (delta <= 10) =====
-        if (delta <= 10) return { label: 'Good', delta, winBefore, winAfter };
+        // ===== Excellent: delta <= 0.5 (gần như best) =====
+        if (delta <= 0.5) return { label: 'Excellent', delta, winBefore, winAfter };
 
-        // ===== Missed: bỏ lỡ cơ hội thắng lớn =====
-        // Chess.com: khi có nước thắng rõ ràng (winBefore >= 80) nhưng không chọn
-        if (delta >= 10 && winBefore >= 80) return { label: 'Missed', delta, winBefore, winAfter };
+        // ===== Good: delta <= 2 =====
+        if (delta <= 2) return { label: 'Good', delta, winBefore, winAfter };
 
-        // ===== Inaccuracy (!?): delta 10-15 =====
-        if (delta <= 15) return { label: 'Inaccuracy', delta, winBefore, winAfter };
+        // ===== Inaccuracy: delta <= 5 =====
+        if (delta <= 5) return { label: 'Inaccuracy', delta, winBefore, winAfter };
 
-        // ===== Mistake (?): delta 15-25 =====
-        if (delta <= 25) return { label: 'Mistake', delta, winBefore, winAfter };
+        // ===== Mistake: delta <= 10 =====
+        if (delta <= 10) return { label: 'Mistake', delta, winBefore, winAfter };
 
-        // ===== Blunder (??): delta > 25 =====
+        // ===== Blunder: delta > 10 =====
         return { label: 'Blunder', delta, winBefore, winAfter };
     },
 
@@ -4091,11 +3694,14 @@ const Analysis = {
             }
         }
 
+        // Accuracy theo Lichess lila formula (canonical)
+        // Lila: accuracy = 103.1668 * exp(-0.04354 * (winBefore - winBest)) - 3.1669
+        // Clamp [0, 100]. 'winBefore - winBest' = delta trung bình.
         const calcAcc = (deltas) => {
             if (!deltas.length) return 100;
-            // Công thức xấp xỉ Chess.com từ trung bình mức giảm % thắng (delta)
             const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-            return Math.max(0, Math.min(100, Math.round(100 - (avg * 2.5))));
+            const acc = 103.1668 * Math.exp(-0.04354 * avg) - 3.1669;
+            return Math.max(0, Math.min(100, Math.round(acc)));
         };
 
         const whiteAcc = calcAcc(whiteDeltas);

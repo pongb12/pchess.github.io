@@ -409,22 +409,14 @@
                         <div class="setting-row">
                             <label>Engine</label>
                             <select id="setting-engine">
-                                <option value="server">Server (Lichess API — depth 60-75, không tải gì)</option>
-                                <option value="lite">Lite local (~7MB, depth 16)</option>
-                                <option value="full">Full local (~108MB, depth 18-22, load chậm)</option>
+                                <option value="lite">Lite (sẵn, ~7MB, depth 16)</option>
+                                <option value="full">Full (user tự tải, ~108MB, depth 18-22)</option>
                             </select>
                         </div>
                         <div class="setting-row setting-hint-row">
-                            <span class="setting-hint">Server: nhanh nhất, độ sâu cao nhất, có tên khai cuộc. Lite/Full: chạy Stockfish trên trình duyệt, không cần Internet (sau khi tải 1 lần).</span>
+                            <span class="setting-hint">Lite: tải nhanh, chạy trên mọi trình duyệt. Full: mạnh hơn, nhưng nặng ~108MB và load chậm lần đầu.</span>
                         </div>
-                        <div class="setting-row">
-                            <label>Lichess Token</label>
-                            <input type="password" id="setting-lichess-token" placeholder="Tùy chọn — cho Opening Explorer">
-                        </div>
-                        <div class="setting-row setting-hint-row">
-                            <span class="setting-hint">Token để dùng Opening Explorer (xem ván masters). Tạo tại <a href="https://lichess.org/account/api/token" target="_blank">lichess.org</a> — chỉ cần scope "Read".</span>
-                        </div>
-                        <div id="engine-local-section" style="display:none">
+                        <div id="engine-local-section">
                             <div class="setting-row">
                                 <label>File Full</label>
                                 <div class="engine-import-row">
@@ -564,10 +556,6 @@
                     <div class="panel-section">
                         <h3>Đánh giá theo giai đoạn</h3>
                         <div id="analysis-phase-stats" class="analysis-phase-stats">—</div>
-                    </div>
-                    <div class="panel-section">
-                        <h3>Opening Explorer <span id="opening-explorer-source" class="opening-explorer-source">(Lichess masters + community)</span></h3>
-                        <div id="analysis-opening-explorer" class="analysis-opening-explorer">Chưa có dữ liệu</div>
                     </div>
                     <div class="panel-section">
                         <h3>Thống kê phân loại</h3>
