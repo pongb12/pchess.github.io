@@ -163,6 +163,13 @@ export default {
       return handleAnalyze(request, env);
     }
 
+    // ===== Opening Explorer endpoint =====
+    // Client gửi FEN, server gọi Lichess masters + community explorer API,
+    // trả về JSON có top moves + số ván + tỷ lệ thắng.
+    if (url.pathname === '/api/opening-explorer') {
+      return handleOpeningExplorer(request);
+    }
+
     // Static assets fallback — defensive: nếu env.ASSETS undefined (do deploy issue),
     // trả về 500 với message rõ ràng thay vì crash.
     if (!env.ASSETS) {
@@ -332,6 +339,117 @@ async function handleAnalyze(request: Request, _env: Env): Promise<Response> {
     positions,
     cached: positions.filter((p) => !p.error).length,
     errors: positions.filter((p) => p.error).length,
+  });
+}
+
+// ===== Opening Explorer endpoint =====
+// Gọi Lichess Opening Explorer API cho masters + community games.
+// Masters: https://explorer.lichess.ovh/masters?fen=...
+// Community: https://explorer.lichess.ovh/lichess?fen=...&speeds[]=blitz&speeds[]=rapid&speeds[]=classical
+const explorerCache = new Map<string, unknown>();
+
+interface ExplorerMove {
+  uci: string;
+  san: string;
+  totalGames: number;
+  whiteWins: number;
+  blackWins: number;
+  draws: number;
+}
+
+interface ExplorerData {
+  moves: ExplorerMove[];
+  totalGames: number;
+  opening?: { eco: string; name: string };
+}
+
+async function lichessExplorer(fen: string, type: 'masters' | 'lichess'): Promise<ExplorerData | null> {
+  const cacheKey = fen + '|' + type;
+  const cached = explorerCache.get(cacheKey);
+  if (cached) return cached as ExplorerData;
+
+  let url: string;
+  if (type === 'masters') {
+    url = `https://explorer.lichess.ovh/masters?fen=${encodeURIComponent(fen)}`;
+  } else {
+    // Community games: blitz + rapid + classical
+    url = `https://explorer.lichess.ovh/lichess?fen=${encodeURIComponent(fen)}&speeds[]=blitz&speeds[]=rapid&speeds[]=classical`;
+  }
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'PChess/1.0 (https://github.com/pongb12/pchess.github.io)',
+        'Accept': 'application/json',
+        // Lichess explorer API yêu cầu Origin header (CORS) — không có sẽ 401.
+        // Dùng origin lichess.org để pass CORS check.
+        'Origin': 'https://lichess.org',
+        'Referer': 'https://lichess.org/',
+      },
+    });
+    if (!resp.ok) {
+      console.log(`[lichessExplorer] type=${type} status=${resp.status}`);
+      return null;
+    }
+    const data = (await resp.json()) as {
+      moves: Array<{ uci: string; san: string; white: number; black: number; draws: number }>;
+      white: number;
+      black: number;
+      draws: number;
+      opening?: { eco: string; name: string };
+    };
+
+    const moves: ExplorerMove[] = (data.moves || []).slice(0, 12).map((m) => ({
+      uci: m.uci,
+      san: m.san,
+      totalGames: m.white + m.black + m.draws,
+      whiteWins: m.white,
+      blackWins: m.black,
+      draws: m.draws,
+    }));
+    const totalGames = data.white + data.black + data.draws;
+    const result: ExplorerData = { moves, totalGames, opening: data.opening };
+    explorerCache.set(cacheKey, result);
+    return result;
+  } catch (e) {
+    console.log(`[lichessExplorer] exception: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+async function handleOpeningExplorer(request: Request): Promise<Response> {
+  if (request.method !== 'POST') {
+    return json({ error: 'method_not_allowed' }, 405);
+  }
+  let body: { fen?: string };
+  try {
+    body = await request.json() as { fen?: string };
+  } catch {
+    return json({ error: 'invalid_json' }, 400);
+  }
+  if (!body.fen) {
+    return json({ error: 'missing_fen' }, 400);
+  }
+
+  // Validate FEN bằng chess.js
+  try {
+    const chess = new Chess();
+    chess.load(body.fen);
+  } catch (e) {
+    return json({ error: 'invalid_fen', message: (e as Error).message }, 400);
+  }
+
+  // Gọi song song masters + community
+  const [masters, community] = await Promise.all([
+    lichessExplorer(body.fen, 'masters'),
+    lichessExplorer(body.fen, 'lichess'),
+  ]);
+
+  return json({
+    ok: true,
+    fen: body.fen,
+    masters,
+    community,
   });
 }
 
