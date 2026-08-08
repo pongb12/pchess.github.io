@@ -2786,20 +2786,33 @@ const Analysis = {
         this.engineFailed(reason + (this._fallbackTried ? ' (đã thử bản Lite cũng fail)' : ''));
     },
 
-    // Kiểm tra xem bản Full đã cài trong IndexedDB chưa
+    // Kiểm tra xem bản Full đã cài trong IndexedDB chưa.
+    // QUAN TRỌNG: nay Full có thể load từ CDN nên không cần IndexedDB nữa.
+    // Luôn trả về true nếu mode='full' hoặc 'auto' (cho phép thử CDN),
+    // trừ khi user đang ở chế độ 'lite' tường minh.
     async _hasFullEngine() {
+        // Nếu user đã download Full vào IndexedDB → dùng cache JS để tiết kiệm request
         try {
             const js = await EngineStore.load('engine-full');
             const wasm = await EngineStore.load('engine-full-wasm');
-            return js && wasm && wasm.size >= 50 * 1048576;
-        } catch (e) {
-            return false;
-        }
+            if (js && wasm && wasm.size >= 50 * 1048576) {
+                this._hasFullInIDB = true;
+                return true;
+            }
+        } catch (e) { /* ignore */ }
+        // Không có IndexedDB vẫn cho phép Full (sẽ load từ CDN)
+        this._hasFullInIDB = false;
+        return true;
     },
 
-    // Trả về { url, revokeUrl }. Với bản Full, giữ WASM ở Blob URL riêng và
-    // truyền qua hash đúng theo loader của stockfish-18-single.js, tránh nhét
-    // ~108MB WASM thành base64 vào worker script.
+    // Trả về { url, revokeUrl }.
+    // - Lite: tải từ server local (cùng origin, ~7MB, instant)
+    // - Full: tải từ CDN (unpkg) thay vì IndexedDB.
+    //   Lý do: WebAssembly.instantiateStreaming không stream đúng với Blob URL
+    //   (buffer toàn bộ 108MB rồi mới compile → treo 5-10 phút).
+    //   Với CDN HTTP URL, trình duyệt stream + compile song song (nhanh hơn 5-10x).
+    //   Browser HTTP cache sẽ cache WASM sau lần đầu, các lần sau nhanh như local.
+    //   IndexedDB vẫn giữ làm fallback offline khi CDN fail.
     async engineUrl() {
         // Nếu đã force dùng lite (do full fail trước đó), luôn dùng lite
         const settingsMode = (window.game && window.game.settings && window.game.settings.engine) || 'auto';
@@ -2813,30 +2826,63 @@ const Analysis = {
         this._engineMode = mode;
 
         if (mode !== 'full') {
-            this.setEngineStatus('Đang tải Stockfish (lite ~7MB)...');
+            this.setEngineStatus('Đang tải Stockfish (lite ~7MB từ server)...');
             return { url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null };
         }
-        this.setEngineStatus('Đang đọc file bản Full từ IndexedDB (~108MB)...');
-        const js = await EngineStore.load('engine-full');
-        const wasm = await EngineStore.load('engine-full-wasm');
-        if (!js) throw new Error('Chưa cài bản Full. Vào Cài đặt > Stockfish và ấn "Tự tải bản Full" (hoặc chọn thủ công 2 file).');
-        if (!wasm) throw new Error('Thiếu file stockfish-18-single.wasm của bản Full. Vào Cài đặt > Stockfish để cài lại.');
-        if (wasm.size < 50 * 1048576) {
-            throw new Error('File .wasm có vẻ không đúng (quá nhỏ, ' + (wasm.size / 1048576).toFixed(1) + 'MB). Hãy cài lại bản Full.');
+
+        // Full mode: load từ CDN để instantiateStreaming hoạt động đúng.
+        const cdnBase = 'https://unpkg.com/stockfish@18.0.8/bin/';
+        const wasmCdnUrl = cdnBase + 'stockfish-18-single.wasm';
+        const jsCdnUrl = cdnBase + 'stockfish-18-single.js';
+
+        this.setEngineStatus('Đang tải Stockfish Full từ CDN (unpkg, ~108MB — stream compile)...');
+
+        // JS file nhỏ (~150KB), fetch as text rồi tạo Blob URL vì new Worker()
+        // yêu cầu same-origin. Thử IndexedDB cache trước để tiết kiệm 1 request.
+        let src = null;
+        try {
+            const cachedJs = await EngineStore.load('engine-full');
+            if (cachedJs && cachedJs.size > 5000) {
+                src = await cachedJs.text();
+                this.setEngineStatus('Đã dùng JS cache本地. Đang khởi tạo Worker (WASM tải từ CDN, stream compile)...');
+            }
+        } catch (e) { /* ignore — fall back to CDN */ }
+
+        if (!src) {
+            try {
+                const res = await fetch(jsCdnUrl);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                src = await res.text();
+            } catch (e) {
+                // CDN fail — thử IndexedDB (nếu user đã từng download)
+                this.setEngineStatus('CDN fail, thử IndexedDB...');
+                const cachedJs = await EngineStore.load('engine-full');
+                const cachedWasm = await EngineStore.load('engine-full-wasm');
+                if (cachedJs && cachedWasm) {
+                    // Fallback IndexedDB (có thể chậm nhưng offline được)
+                    this.setEngineStatus('Đang load bản Full từ IndexedDB (offline mode, có thể chậm)...');
+                    const jsUrl = URL.createObjectURL(new Blob([await cachedJs.text()], { type: 'text/javascript' }));
+                    const wasmUrl = URL.createObjectURL(cachedWasm);
+                    return {
+                        url: jsUrl + '#' + encodeURIComponent(wasmUrl) + ',worker',
+                        revokeUrl: [jsUrl, wasmUrl]
+                    };
+                }
+                throw new Error('Không tải được JS từ CDN và không có cache IndexedDB: ' + e.message);
+            }
         }
-        this.setEngineStatus('Đang tạo Blob URL cho bản Full...');
-        const src = await js.text();
+
         if (src.length < 5000 || src.indexOf('stockfish') === -1) {
-            throw new Error('File stockfish-18-single.js không đúng phiên bản (size ' + src.length + ' bytes). Cài lại bản Full.');
+            throw new Error('File stockfish-18-single.js không đúng phiên bản (size ' + src.length + ' bytes).');
         }
-        const jsUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
-        const wasmUrl = URL.createObjectURL(wasm);
-        // Stockfish-18-single.js đọc wasm URL từ self.location.hash theo format:
-        //   #<encodedWasmUrl>,worker
-        // Sau đó fetch(wasmUrl) để load WASM. Cơ chế này hoạt động cả với Blob URL.
+
+        const jsBlobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        // Worker sẽ fetch WASM từ CDN — HTTP streaming → instantiateStreaming
+        // compile song song với download (không buffer toàn bộ rồi mới compile).
+        this.setEngineStatus('Đang khởi tạo Worker + tải WASM từ CDN (stream compile)...');
         return {
-            url: jsUrl + '#' + encodeURIComponent(wasmUrl) + ',worker',
-            revokeUrl: [jsUrl, wasmUrl]
+            url: jsBlobUrl + '#' + encodeURIComponent(wasmCdnUrl) + ',worker',
+            revokeUrl: [jsBlobUrl]
         };
     },
 
