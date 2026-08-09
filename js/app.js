@@ -2952,7 +2952,7 @@ const Analysis = {
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
         this.engine.postMessage(cmd);
-        this.engine.postMessage('go depth 16');
+        this.engine.postMessage('go depth 18');
         document.getElementById('analysis-bestmove').textContent =
             (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
     },
@@ -3402,7 +3402,7 @@ const Analysis = {
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
         this.engine.postMessage(cmd);
-        this.engine.postMessage('go depth 16');
+        this.engine.postMessage('go depth 18');
         document.getElementById('analysis-bestmove').textContent =
             (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
     },
@@ -3596,16 +3596,37 @@ const Analysis = {
         const text = this.formatScore(ev.score);
         document.getElementById('analysis-eval-text').textContent = text;
 
+        // ===== Eval bar: dùng sigmoid win% (chuẩn Lichess/Chess.com) =====
+        // Eval bar thể hiện % thắng của Trắng (trên = Trắng, dưới = Đen).
+        // - cp = 0 → 50% (cân bằng)
+        // - cp = +100 → ~64% (Trắng lợi thế nhẹ)
+        // - cp = +300 → ~85% (Trắng lợi thế lớn)
+        // - cp = -100 → ~36% (Đen lợi thế nhẹ)
+        // - mate +N → ~100% (Trắng chiếu hết)
+        // - mate -N → ~0% (Đen chiếu hết)
+        //
+        // QUAN TRỌNG: eval sau nước lẻ (Đen đi) là từ góc nhìn Đen (đối phương).
+        // Cần đổi dấu để quy về góc nhìn Trắng.
         const fill = document.getElementById('analysis-eval-fill');
-        let pct = 50;
+        let whiteWinPct; // 0-100, % thắng của Trắng
+        let cp = ev.score.type === 'cp' ? ev.score.value : 0;
+        // ply lẻ = sau nước của Trắng (Trắng vừa đi, eval là góc nhìn Đen)
+        // → đổi dấu để quy về Trắng
+        if (ply % 2 === 1) cp = -cp;
+
         if (ev.score.type === 'mate') {
-            pct = ev.score.value > 0 ? 96 : 4;
+            // Mate: quy về góc nhìn Trắng
+            let mateVal = ev.score.value;
+            if (ply % 2 === 1) mateVal = -mateVal; // Đen vừa đi
+            whiteWinPct = mateVal > 0 ? 100 : 0;
         } else {
-            const cp = ev.score.value;
-            pct = 50 + Math.max(-46, Math.min(46, cp / 120 * 46));
+            // Sigmoid: cp → % thắng của Trắng
+            whiteWinPct = 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
         }
-        fill.style.height = pct + '%';
-        fill.style.background = pct >= 50
+        whiteWinPct = Math.max(0, Math.min(100, whiteWinPct));
+
+        fill.style.height = whiteWinPct + '%';
+        fill.style.background = whiteWinPct >= 50
             ? 'linear-gradient(to top, #fafafa, #e0e0e0)'
             : 'linear-gradient(to top, #3a3a3a, #555555)';
 
@@ -3754,21 +3775,24 @@ const Analysis = {
 
         // Tính toán độ chính xác % cho Trắng và Đen
         let whiteDeltas = [], blackDeltas = [];
+        // Đếm classifications riêng cho Trắng và Đen (FIX bug hiển thị giống nhau)
+        const whiteCounts = {};
+        const blackCounts = {};
         for (let i = 1; i <= this.pgnMoves.length; i++) {
             const c = this.classifications[i];
             if (c && c.delta !== undefined) {
-                // i là số lẻ -> nước đi của Trắng, i số chẵn -> Đen (1-based index)
+                // i lẻ = nước đi của Trắng, i chẵn = Đen (1-based index)
                 if (i % 2 === 1) {
                     whiteDeltas.push(c.delta);
+                    whiteCounts[c.label] = (whiteCounts[c.label] || 0) + 1;
                 } else {
                     blackDeltas.push(c.delta);
+                    blackCounts[c.label] = (blackCounts[c.label] || 0) + 1;
                 }
             }
         }
 
         // Accuracy theo Lichess lila formula (canonical)
-        // Lila: accuracy = 103.1668 * exp(-0.04354 * (winBefore - winBest)) - 3.1669
-        // Clamp [0, 100]. 'winBefore - winBest' = delta trung bình.
         const calcAcc = (deltas) => {
             if (!deltas.length) return 100;
             const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
@@ -3793,66 +3817,32 @@ const Analysis = {
             </div>
         `;
 
-        // Định nghĩa thứ tự và cấu hình phân loại theo đúng yêu cầu từ trên xuống
+        // Định nghĩa thứ tự và cấu hình phân loại
         const classConfig = [
             { key: 'Brilliant', label: 'Thiên tài', iconFile: 'brilliant.svg', className: 'brilliant' },
             { key: 'Great', label: 'Great Move', iconFile: 'great_find.svg', className: 'great' },
             { key: 'Best', label: 'Nước đi tốt nhất', iconFile: 'best.svg', className: 'best' },
             { key: 'Excellent', label: 'Tuyệt vời', iconFile: 'excellent.svg', className: 'excellent' },
             { key: 'Good', label: 'Tốt', iconFile: 'good.svg', className: 'good' },
-        ];
-
-        // Đếm các phân loại nước đi từ classifications
-        const counts = {};
-        for (let i = 1; i <= this.pgnMoves.length; i++) {
-            const c = this.classifications[i];
-            if (c) {
-                counts[c.label] = (counts[c.label] || 0) + 1;
-            }
-        }
-
-        // Đếm Book riêng
-        let bookCount = 0;
-        for (let i = 1; i <= this.pgnMoves.length; i++) {
-            const c = this.classifications[i];
-            if (c && c.label === 'Book') {
-                bookCount++;
-            }
-        }
-
-        for (const cfg of classConfig) {
-            const count = counts[cfg.key] || 0;
-            html += `
-                <div class="cs-row ${cfg.className}">
-                    <span class="cs-count">${count}</span>
-                    <div class="cs-main">
-                        <span class="cs-icon" data-icon-file="${cfg.iconFile}"></span>
-                        <span class="cs-name">${cfg.label}</span>
-                    </div>
-                    <span class="cs-count">${count}</span>
-                </div>
-            `;
-        }
-
-        // Thêm các hàng còn lại: Book, Inaccuracy, Mistake, Blunder, Missed
-        const remainingConfig = [
-            { key: 'Book', label: 'Chủ đề sách', iconFile: 'book.svg', className: 'book', customCount: bookCount },
+            { key: 'Book', label: 'Chủ đề sách', iconFile: 'book.svg', className: 'book' },
             { key: 'Inaccuracy', label: 'Không chính xác', iconFile: 'inaccuracy.svg', className: 'inaccuracy' },
             { key: 'Mistake', label: 'Sai lầm', iconFile: 'mistake.svg', className: 'mistake' },
-            { key: 'Blunder', label: 'Nước sai lầm ngớ ngẩn', iconFile: 'blunder.svg', className: 'blunder' },
+            { key: 'Blunder', label: 'Sai lầm ngớ ngẩn', iconFile: 'blunder.svg', className: 'blunder' },
             { key: 'Missed', label: 'Bỏ lỡ', iconFile: 'missed_win.svg', className: 'missed' },
         ];
 
-        for (const cfg of remainingConfig) {
-            const count = cfg.customCount !== undefined ? cfg.customCount : (counts[cfg.key] || 0);
+        // Hiển thị từng hàng với count Trắng (trái) và Đen (phải) riêng biệt
+        for (const cfg of classConfig) {
+            const wCount = whiteCounts[cfg.key] || 0;
+            const bCount = blackCounts[cfg.key] || 0;
             html += `
                 <div class="cs-row ${cfg.className}">
-                    <span class="cs-count">${count}</span>
+                    <span class="cs-count">${wCount}</span>
                     <div class="cs-main">
                         <span class="cs-icon" data-icon-file="${cfg.iconFile}"></span>
                         <span class="cs-name">${cfg.label}</span>
                     </div>
-                    <span class="cs-count">${count}</span>
+                    <span class="cs-count">${bCount}</span>
                 </div>
             `;
         }
