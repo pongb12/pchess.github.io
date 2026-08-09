@@ -3020,6 +3020,52 @@ const Analysis = {
         }
     },
 
+    // ===== UCI parsing helpers (cho local Stockfish mode) =====
+    // Parse "score cp 23" hoặc "score mate 5" từ info line
+    parseScore(line) {
+        const m = line.match(/score (cp|mate) (-?\d+)/);
+        if (!m) return null;
+        if (m[1] === 'mate') {
+            const moves = parseInt(m[2], 10);
+            return { type: 'mate', value: moves };
+        }
+        return { type: 'cp', value: parseInt(m[2], 10) };
+    },
+
+    // Parse "depth 18" từ info line
+    parseDepth(line) {
+        const m = line.match(/depth (\d+)/);
+        return m ? parseInt(m[1], 10) : null;
+    },
+
+    // Parse "pv e2e4 e7e5 g1f3" → ["e4", "e5", "Nf3"] (UCI → SAN)
+    // Replay từ vị trí ở ply để convert UCI sang SAN bằng chess.js
+    parsePv(line, ply) {
+        const m = line.match(/ pv (.+)$/);
+        if (!m) return [];
+        const ucis = m[1].trim().split(/\s+/);
+        // Dựng lại vị trí ở ply từ đầu rồi chơi PV
+        const ch = new Chess();
+        try {
+            for (let i = 0; i < ply; i++) ch.move(this.pgnMoves[i]);
+        } catch (e) { /* ignore */ }
+        const sans = [];
+        for (const u of ucis) {
+            if (u.length < 4) break;
+            try {
+                const mv = ch.move({
+                    from: u.slice(0, 2),
+                    to: u.slice(2, 4),
+                    promotion: u.length > 4 ? u[4] : undefined
+                });
+                if (mv) sans.push(mv.san);
+                else break;
+            } catch (e) {
+                break;
+            }
+        }
+        return sans;
+    },
 
     // ===== Local batch analysis (cho lite/full mode) =====
     analyzeAll() {
