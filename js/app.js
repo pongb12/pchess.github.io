@@ -2784,20 +2784,34 @@ const Analysis = {
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
             this.engine.postMessage('uci');
 
-            if (this._heartbeatTimer) clearTimeout(this._heartbeatTimer);
-            this._heartbeatTimer = setTimeout(() => {
-                if (gen !== this._gen) return;
-                if (!this.ready && !this.failed && mode === 'full') {
-                    this.setEngineStatus('Vẫn đang compile WASM (108MB). Có thể mất đến 5 phút trên máy yếu...');
+            if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
+            // Heartbeat cập nhật status mỗi 20s để user biết engine đang compile
+            let heartbeatCount = 0;
+            this._heartbeatTimer = setInterval(() => {
+                if (gen !== this._gen || this.ready || this.failed) {
+                    clearInterval(this._heartbeatTimer);
+                    return;
                 }
-            }, 30000);
+                heartbeatCount++;
+                if (mode === 'full') {
+                    const elapsed = heartbeatCount * 20;
+                    const msg = heartbeatCount <= 3
+                        ? `Đang compile WASM (108MB)... đã ${elapsed}s`
+                        : heartbeatCount <= 9
+                        ? `Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút cho bản Full.`
+                        : `Đã ${elapsed}s — nếu quá lâu, thử đóng và mở lại Analysis, hoặc dùng bản Lite.`;
+                    this.setEngineStatus(msg);
+                }
+            }, 20000);
 
-            const timeout = (mode === 'full') ? 300000 : 30000;
+            // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
+            // Lite chỉ cần 30s
+            const timeout = (mode === 'full') ? 480000 : 30000; // 8 phút / 30s
             if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
             this._watchdogTimer = setTimeout(() => {
                 if (gen !== this._gen) return;
                 if (!this.ready && !this.failed) {
-                    this.engineFailed('Stockfish không phản hồi sau ' + (timeout / 1000) + 's');
+                    this.engineFailed('Stockfish không phản hồi sau ' + (timeout / 1000) + 's. Thử lại với bản Lite.');
                 }
             }, timeout);
         }).catch((err) => {
@@ -2864,7 +2878,7 @@ const Analysis = {
     engineFailed(msg) {
         this.failed = true;
         if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.setEngineStatus('⚠️ ' + msg, true);
         if (this.engine) {
             try { this.engine.terminate(); } catch (e) { /* ignore */ }
@@ -2896,7 +2910,7 @@ const Analysis = {
         this.ready = false;
         this.failed = false;
         if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-        if (this._heartbeatTimer) { clearTimeout(this._heartbeatTimer); this._heartbeatTimer = null; }
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.pendingPly = null;
         this.requestPly = null;
         this.batchQueue = null;
@@ -2961,7 +2975,7 @@ const Analysis = {
     onEngineMessage(data) {
         if (typeof data !== 'string') return;
         if (this._heartbeatTimer) {
-            clearTimeout(this._heartbeatTimer);
+            clearInterval(this._heartbeatTimer);
             this._heartbeatTimer = null;
         }
         if (data === 'uciok') {
@@ -3526,34 +3540,45 @@ const Analysis = {
         const bestCp = this.cpOf(before.score);
         const afterCp = this.cpOf(after.score);
         if (bestCp == null || afterCp == null) return null;
-        const winBefore = this.winPct(bestCp);
-        const winAfter = this.winPct(-afterCp); // eval sau nước là của đối phương -> đổi dấu
-        if (winBefore == null || winAfter == null) return null;
-        const delta = winBefore - winAfter; // % thắng bị mất (0..100)
+        // winPct từ góc nhìn PLAYER vừa đi (chuẩn Lichess)
+        // ply lẻ = Trắng đi → wb = winPct(bestCp), wa = winPct(-afterCp)
+        // ply chẵn = Đen đi → wb = winPct(-bestCp), wa = winPct(afterCp)
+        let wb, wa;
+        if (i % 2 === 1) {
+            wb = this.winPct(bestCp);
+            wa = this.winPct(-afterCp);
+        } else {
+            wb = this.winPct(-bestCp);
+            wa = this.winPct(afterCp);
+        }
+        if (wb == null || wa == null) return null;
+        // delta = winBefore - winAfter (mất bao nhiêu % thắng)
+        // Nếu player đi tốt hơn best (wa > wb) → delta âm → vẫn tính là Best
+        const delta = Math.max(0, wb - wa); // clamp >= 0 để accuracy không > 100%
 
         const moverColor = (i - 1) % 2 === 0 ? 'w' : 'b';
         const bestSan = before.pv && before.pv[0];
         const playedSan = this.pgnMoves[i - 1];
         const isBest = !!bestSan && bestSan === playedSan;
 
+        // Lưu wb/wa để dùng cho accuracy calculation
+        const winBefore = wb;
+        const winAfter = wa;
+
         // Book: nước đầu (<=10 ply) gần đúng khai cuộc
         if (i <= this.BOOK_PLY && delta <= 5) return { label: 'Book', delta, winBefore, winAfter };
 
         // ===== Brilliant (!!): sacrifice material + isBest + winAfter tốt =====
-        // Lila: chỉ đánh Brilliant khi nước đi là best, có hy sinh material,
-        // và sau nước đó vẫn giữ lợi thế (winAfter >= 50 hoặc forced mate).
         if (isBest && winAfter >= 50) {
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
             const matLost = bal0 - bal1;
-            // Hy sinh >= 1.5 pawns + vẫn thắng (winAfter >= 60 hoặc mate)
             if (matLost >= 1.5 && (winAfter >= 60 || (after.score && after.score.type === 'mate' && after.score.value > 0))) {
                 return { label: 'Brilliant', delta, winBefore, winAfter };
             }
         }
 
         // ===== Great (!): rescue từ thế khó → cầm cờ/thắng =====
-        // Lila: delta rất nhỏ + chuyển thế thua thành thắng/cầm cờ
         if (delta <= 2 && ((winBefore <= 30 && winAfter >= 50) || (winBefore <= 50 && winAfter >= 75))) {
             return { label: 'Great', delta, winBefore, winAfter };
         }
@@ -3562,7 +3587,6 @@ const Analysis = {
         if (isBest) return { label: 'Best', delta, winBefore, winAfter };
 
         // ===== Missed: bỏ lỡ cơ hội thắng rõ ràng =====
-        // Lila: khi winBefore >= 80 (đang thắng lớn) nhưng delta >= 5
         if (delta >= 5 && winBefore >= 80) return { label: 'Missed', delta, winBefore, winAfter };
 
         // ===== Excellent: delta <= 0.5 (gần như best) =====
@@ -3773,35 +3797,43 @@ const Analysis = {
         const container = document.getElementById('analysis-classification-stats');
         if (!container) return;
 
-        // Tính toán độ chính xác % cho Trắng và Đen
-        let whiteDeltas = [], blackDeltas = [];
-        // Đếm classifications riêng cho Trắng và Đen (FIX bug hiển thị giống nhau)
+        // Tính accuracy theo per-move (chuẩn Lichess lila):
+        // accuracy = 103.1668 * exp(-0.04354 * (wb - wa)) - 3.1669
+        // wb = winPct trước nước (từ góc nhìn player)
+        // wa = winPct sau nước (từ góc nhìn player)
+        // Nếu wa >= wb (player đi tốt hơn best) → accuracy = 100%
+        const whiteAccuracies = [];
+        const blackAccuracies = [];
         const whiteCounts = {};
         const blackCounts = {};
         for (let i = 1; i <= this.pgnMoves.length; i++) {
             const c = this.classifications[i];
-            if (c && c.delta !== undefined) {
-                // i lẻ = nước đi của Trắng, i chẵn = Đen (1-based index)
+            if (c && c.winBefore !== undefined && c.winAfter !== undefined) {
+                const wb = c.winBefore;
+                const wa = c.winAfter;
+                // Per-move accuracy theo lila
+                let acc;
+                if (wa >= wb) acc = 100; // player đi bằng hoặc tốt hơn best
+                else acc = 103.1668 * Math.exp(-0.04354 * (wb - wa)) - 3.1669;
+                acc = Math.max(0, Math.min(100, acc));
+
                 if (i % 2 === 1) {
-                    whiteDeltas.push(c.delta);
+                    whiteAccuracies.push(acc);
                     whiteCounts[c.label] = (whiteCounts[c.label] || 0) + 1;
                 } else {
-                    blackDeltas.push(c.delta);
+                    blackAccuracies.push(acc);
                     blackCounts[c.label] = (blackCounts[c.label] || 0) + 1;
                 }
             }
         }
 
-        // Accuracy theo Lichess lila formula (canonical)
-        const calcAcc = (deltas) => {
-            if (!deltas.length) return 100;
-            const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-            const acc = 103.1668 * Math.exp(-0.04354 * avg) - 3.1669;
-            return Math.max(0, Math.min(100, Math.round(acc)));
+        // Accuracy trung bình = trung bình per-move accuracy
+        const avgAcc = (accs) => {
+            if (!accs.length) return 0;
+            return Math.round(accs.reduce((a, b) => a + b, 0) / accs.length);
         };
-
-        const whiteAcc = calcAcc(whiteDeltas);
-        const blackAcc = calcAcc(blackDeltas);
+        const whiteAcc = avgAcc(whiteAccuracies);
+        const blackAcc = avgAcc(blackAccuracies);
 
         let html = `
             <div class="cs-accuracy-header">
