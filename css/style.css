@@ -1585,6 +1585,13 @@ html, body {
     justify-content: center;
 }
 
+.bestmove-loading {
+    color: var(--accent);
+    font-size: 0.85rem;
+    animation: pulse-text 1.5s infinite;
+    text-align: center;
+}
+
 /* ===== Engine Stats Panel (depth, nodes, nps, time) ===== */
 .engine-stats {
     margin-top: 8px;

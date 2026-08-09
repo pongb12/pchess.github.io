@@ -2815,11 +2815,14 @@ const Analysis = {
             this.engine.postMessage('uci');
 
             if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
-            // Heartbeat cập nhật status mỗi 20s để user biết engine đang compile
+            // Heartbeat cập nhật status mỗi 5s để user biết engine đang compile
             let heartbeatCount = 0;
             this._engineStartTime = Date.now();
             this._setEngineStat('mode', mode);
             this._setEngineStat('status', 'Đang tải...', 'loading');
+            // Cập nhật analysis-bestmove để hiện progress load
+            const bestmoveEl = document.getElementById('analysis-bestmove');
+            if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải Stockfish ${mode}...</span>`;
             this._heartbeatTimer = setInterval(() => {
                 if (gen !== this._gen || this.ready || this.failed) {
                     clearInterval(this._heartbeatTimer);
@@ -2827,19 +2830,21 @@ const Analysis = {
                 }
                 heartbeatCount++;
                 const elapsed = Math.floor((Date.now() - this._engineStartTime) / 1000);
+                let msg;
                 if (mode === 'full') {
-                    const msg = elapsed <= 60
-                        ? `Đang compile WASM (108MB)... đã ${elapsed}s`
+                    msg = elapsed <= 60
+                        ? `⏳ Đang compile WASM (108MB)... đã ${elapsed}s`
                         : elapsed <= 180
-                        ? `Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút.`
-                        : `Đã ${elapsed}s — nếu quá lâu, thử đóng và mở lại Analysis, hoặc dùng bản Lite.`;
-                    this.setEngineStatus(msg);
-                    this._setEngineStat('status', msg, 'loading');
-                    this._setEngineStat('time', this._formatTime(elapsed * 1000));
+                        ? `⏳ Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút.`
+                        : `⏳ Đã ${elapsed}s — nếu quá lâu, thử đóng và mở lại Analysis, hoặc dùng bản Lite.`;
                 } else {
-                    this._setEngineStat('status', `Đang load Lite... đã ${elapsed}s`, 'loading');
+                    msg = `⏳ Đang load Lite... đã ${elapsed}s`;
                 }
-            }, 5000); // Update mỗi 5s để realtime hơn
+                this.setEngineStatus(msg.replace('⏳ ', ''));
+                this._setEngineStat('status', msg.replace('⏳ ', ''), 'loading');
+                this._setEngineStat('time', this._formatTime(elapsed * 1000));
+                if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">${msg}</span>`;
+            }, 5000);
 
             // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
             // Lite chỉ cần 30s
@@ -3005,8 +3010,8 @@ const Analysis = {
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth 18');
-        document.getElementById('analysis-bestmove').textContent =
-            (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
+        const _bm = document.getElementById('analysis-bestmove');
+        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
     },
 
     // ===== Local engine message handler =====
@@ -3083,15 +3088,21 @@ const Analysis = {
     // Stockfish info line format:
     //   info depth 18 seldepth 24 multipv 1 score cp 23 nodes 1234567 nps 2000000 time 617 pv e2e4 ...
     _updateEngineStats(data) {
+        let updatedAny = false;
+
         // Depth
         const depthMatch = data.match(/depth (\d+)/);
-        if (depthMatch) this._setEngineStat('depth', depthMatch[1]);
+        if (depthMatch) {
+            this._setEngineStat('depth', depthMatch[1]);
+            updatedAny = true;
+        }
 
         // Nodes
         const nodesMatch = data.match(/nodes (\d+)/);
         if (nodesMatch) {
             const n = parseInt(nodesMatch[1], 10);
             this._setEngineStat('nodes', this._formatNumber(n));
+            updatedAny = true;
         }
 
         // NPS (nodes per second)
@@ -3099,6 +3110,7 @@ const Analysis = {
         if (npsMatch) {
             const nps = parseInt(npsMatch[1], 10);
             this._setEngineStat('nps', this._formatNumber(nps) + '/s');
+            updatedAny = true;
         }
 
         // Time (ms)
@@ -3106,10 +3118,23 @@ const Analysis = {
         if (timeMatch) {
             const ms = parseInt(timeMatch[1], 10);
             this._setEngineStat('time', this._formatTime(ms));
+            updatedAny = true;
         }
 
         // Status: đang search
-        this._setEngineStat('status', 'Đang search...', 'loading');
+        if (updatedAny) {
+            this._setEngineStat('status', 'Đang search...', 'loading');
+            // Cập nhật analysis-bestmove với progress info
+            const ply = this.pendingPly;
+            const depthStr = depthMatch ? depthMatch[1] : '?';
+            const nodesStr = nodesMatch ? this._formatNumber(parseInt(nodesMatch[1], 10)) : '?';
+            const npsStr = npsMatch ? this._formatNumber(parseInt(npsMatch[1], 10)) + '/s' : '?';
+            const timeStr = timeMatch ? this._formatTime(parseInt(timeMatch[1], 10)) : '?';
+            const bestmove = document.getElementById('analysis-bestmove');
+            if (bestmove && ply != null) {
+                bestmove.innerHTML = `<span class="bestmove-loading">🔄 Đang phân tích ply ${ply}/${this.pgnMoves.length} — depth ${depthStr} | ${nodesStr} nodes | ${npsStr} | ${timeStr}</span>`;
+            }
+        }
     },
 
     _setEngineStat(name, value, cls) {
@@ -3517,8 +3542,8 @@ const Analysis = {
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth 18');
-        document.getElementById('analysis-bestmove').textContent =
-            (this.evals[this.index] ? 'Đã có đánh giá' : 'Đang phân tích...');
+        const _bm = document.getElementById('analysis-bestmove');
+        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
     },
 
     // ===== Phân tích toàn bộ ván (chạy tuần tự từng vị trí) =====
