@@ -609,7 +609,7 @@ class PChessGame {
         document.getElementById('setting-coords').checked = this.settings.coords;
         document.getElementById('setting-timer').value = this.settings.timer;
         const engineSelect = document.getElementById('setting-engine');
-        if (engineSelect) engineSelect.value = this.settings.engine === 'full' ? 'full' : 'lite';
+        if (engineSelect) engineSelect.value = this.settings.engine || 'lite';
         document.querySelectorAll('.theme-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.theme === this.settings.theme);
         });
@@ -2781,11 +2781,14 @@ const Analysis = {
         this.stopEngine();
     },
 
-    // ===== Engine mode: chỉ có 'lite' và 'full' =====
+    // ===== Engine mode: lite, full, hoặc nexus =====
     getEngineMode() {
         const g = window.game;
         if (!g || !g.settings) return 'lite';
-        return g.settings.engine === 'full' ? 'full' : 'lite';
+        const mode = g.settings.engine;
+        if (mode === 'full') return 'full';
+        if (mode === 'nexus') return 'nexus';
+        return 'lite';
     },
 
     ensureEngine() {
@@ -2823,8 +2826,9 @@ const Analysis = {
             // Hiện load progress bar (Full mode)
             this._showLoadProgress(mode === 'full');
             // Cập nhật analysis-bestmove để hiện progress load
+            const engineName = mode === 'nexus' ? 'Nexus 6.1' : 'Stockfish ' + mode;
             const bestmoveEl = document.getElementById('analysis-bestmove');
-            if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải Stockfish ${mode}...</span>`;
+            if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải ${engineName}...</span>`;
             this._heartbeatTimer = setInterval(() => {
                 if (gen !== this._gen || this.ready || this.failed) {
                     clearInterval(this._heartbeatTimer);
@@ -2870,6 +2874,9 @@ const Analysis = {
         const mode = this._engineMode || this.getEngineMode();
         if (mode === 'lite') {
             return Promise.resolve({ url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null });
+        }
+        if (mode === 'nexus') {
+            return Promise.resolve({ url: 'nexus/nexus-worker.js', revokeUrl: null });
         }
         // Full mode: thử IndexedDB cache, fallback CDN
         return this._fullEngineUrl();
@@ -3013,8 +3020,10 @@ const Analysis = {
             } catch (e) { break; }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
+        const isNexus = this._engineMode === 'nexus';
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth 18');
+        if (isNexus) this.engine.postMessage('quit'); // Nexus needs quit to end UCI loop
         const _bm = document.getElementById('analysis-bestmove');
         if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
     },
@@ -3022,6 +3031,15 @@ const Analysis = {
     // ===== Local engine message handler =====
     onEngineMessage(data) {
         if (typeof data !== 'string') return;
+        // Nexus worker sends 'NEXUS_READY' when module loaded
+        if (data === 'NEXUS_READY') {
+            this._nexusReady = true;
+            return;
+        }
+        if (data.startsWith('ERROR:')) {
+            this.engineFailed(data.substring(6));
+            return;
+        }
         if (this._heartbeatTimer) {
             clearInterval(this._heartbeatTimer);
             this._heartbeatTimer = null;
