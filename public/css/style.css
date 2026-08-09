@@ -1585,6 +1585,65 @@ html, body {
     justify-content: center;
 }
 
+/* ===== Engine Stats Panel (depth, nodes, nps, time) ===== */
+.engine-stats {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--board-border);
+    border-radius: var(--radius-sm);
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px 12px;
+    font-size: 0.78rem;
+}
+.engine-stat-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 4px 6px;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+}
+.engine-stat-label {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.engine-stat-value {
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 0.82rem;
+}
+/* Highlight status khi đang load */
+.engine-stat-value.loading {
+    color: var(--warning);
+    animation: pulse-text 1.5s infinite;
+}
+.engine-stat-value.ready {
+    color: var(--success);
+}
+.engine-stat-value.error {
+    color: var(--danger);
+}
+@keyframes pulse-text {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+@media (max-width: 600px) {
+    .engine-stats {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 4px 8px;
+        padding: 8px;
+        font-size: 0.72rem;
+    }
+    .engine-stat-value {
+        font-size: 0.75rem;
+    }
+}
+
 .analysis-panel {
     flex: 0 0 340px;
     display: flex;

@@ -297,6 +297,36 @@ const DebugPanel = {
                 lines.push('WS: none');
             }
             lines.push(`Ping: ${g.lastPing != null ? g.lastPing + 'ms' : '-'}`);
+
+            // Engine status (nếu Analysis đang hoạt động)
+            if (window.Analysis) {
+                const a = window.Analysis;
+                lines.push('--- Engine ---');
+                lines.push(`Mode: ${a._engineMode || '?'}`);
+                lines.push(`Ready: ${a.ready} | Failed: ${a.failed}`);
+                if (a.engine) {
+                    lines.push(`Engine: ${a.engine.constructor.name}`);
+                } else {
+                    lines.push('Engine: none');
+                }
+                if (a._engineStartTime) {
+                    const elapsed = Math.floor((Date.now() - a._engineStartTime) / 1000);
+                    lines.push(`Load time: ${elapsed}s`);
+                }
+                if (a.evals && Object.keys(a.evals).length > 0) {
+                    const plyCount = Object.keys(a.evals).length;
+                    lines.push(`Evals: ${plyCount} positions`);
+                }
+                if (a.batchQueue) {
+                    lines.push(`Batch: ${a.batchQueue.length} còn lại`);
+                }
+                // Latest eval (nếu có)
+                if (a.evals && a.index >= 0 && a.evals[a.index]) {
+                    const ev = a.evals[a.index];
+                    const score = ev.score ? (ev.score.type === 'mate' ? 'M' + ev.score.value : (ev.score.value / 100).toFixed(2)) : '?';
+                    lines.push(`Current: ply ${a.index}, score ${score}, depth ${ev.depth || '?'}`);
+                }
+            }
         } catch (err) {
             lines.push('Lỗi đọc trạng thái: ' + err.message);
         }
@@ -2787,22 +2817,29 @@ const Analysis = {
             if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
             // Heartbeat cập nhật status mỗi 20s để user biết engine đang compile
             let heartbeatCount = 0;
+            this._engineStartTime = Date.now();
+            this._setEngineStat('mode', mode);
+            this._setEngineStat('status', 'Đang tải...', 'loading');
             this._heartbeatTimer = setInterval(() => {
                 if (gen !== this._gen || this.ready || this.failed) {
                     clearInterval(this._heartbeatTimer);
                     return;
                 }
                 heartbeatCount++;
+                const elapsed = Math.floor((Date.now() - this._engineStartTime) / 1000);
                 if (mode === 'full') {
-                    const elapsed = heartbeatCount * 20;
-                    const msg = heartbeatCount <= 3
+                    const msg = elapsed <= 60
                         ? `Đang compile WASM (108MB)... đã ${elapsed}s`
-                        : heartbeatCount <= 9
-                        ? `Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút cho bản Full.`
+                        : elapsed <= 180
+                        ? `Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút.`
                         : `Đã ${elapsed}s — nếu quá lâu, thử đóng và mở lại Analysis, hoặc dùng bản Lite.`;
                     this.setEngineStatus(msg);
+                    this._setEngineStat('status', msg, 'loading');
+                    this._setEngineStat('time', this._formatTime(elapsed * 1000));
+                } else {
+                    this._setEngineStat('status', `Đang load Lite... đã ${elapsed}s`, 'loading');
                 }
-            }, 20000);
+            }, 5000); // Update mỗi 5s để realtime hơn
 
             // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
             // Lite chỉ cần 30s
@@ -2880,6 +2917,7 @@ const Analysis = {
         if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
         if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.setEngineStatus('⚠️ ' + msg, true);
+        this._setEngineStat('status', 'Lỗi: ' + msg.substring(0, 60), 'error');
         if (this.engine) {
             try { this.engine.terminate(); } catch (e) { /* ignore */ }
             this.engine = null;
@@ -2978,10 +3016,15 @@ const Analysis = {
             clearInterval(this._heartbeatTimer);
             this._heartbeatTimer = null;
         }
+        // Update engine stats từ mọi info line (depth, nodes, nps, time)
+        if (data.indexOf('info ') === 0) {
+            this._updateEngineStats(data);
+        }
         if (data === 'uciok') {
             this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
             this.engine.postMessage('isready');
             this.setEngineStatus('Đang chờ Stockfish ready...');
+            this._setEngineStat('status', 'UCI OK — đang ready', 'loading');
             return;
         }
         if (data === 'readyok') {
@@ -2989,6 +3032,8 @@ const Analysis = {
             this.failed = false;
             if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
             this.setEngineStatus('Stockfish sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', mode ' + (this._engineMode || '?') + ')');
+            this._setEngineStat('status', 'Ready', 'ready');
+            this._setEngineStat('mode', this._engineMode || '?');
             this.analyzeCurrent();
             if (this.pendingStartAfterReady) {
                 this.pendingStartAfterReady = false;
@@ -3032,6 +3077,61 @@ const Analysis = {
             }
             if (this.requestPly != null) this.analyzeCurrent();
         }
+    },
+
+    // ===== Parse engine stats từ info line =====
+    // Stockfish info line format:
+    //   info depth 18 seldepth 24 multipv 1 score cp 23 nodes 1234567 nps 2000000 time 617 pv e2e4 ...
+    _updateEngineStats(data) {
+        // Depth
+        const depthMatch = data.match(/depth (\d+)/);
+        if (depthMatch) this._setEngineStat('depth', depthMatch[1]);
+
+        // Nodes
+        const nodesMatch = data.match(/nodes (\d+)/);
+        if (nodesMatch) {
+            const n = parseInt(nodesMatch[1], 10);
+            this._setEngineStat('nodes', this._formatNumber(n));
+        }
+
+        // NPS (nodes per second)
+        const npsMatch = data.match(/nps (\d+)/);
+        if (npsMatch) {
+            const nps = parseInt(npsMatch[1], 10);
+            this._setEngineStat('nps', this._formatNumber(nps) + '/s');
+        }
+
+        // Time (ms)
+        const timeMatch = data.match(/time (\d+)/);
+        if (timeMatch) {
+            const ms = parseInt(timeMatch[1], 10);
+            this._setEngineStat('time', this._formatTime(ms));
+        }
+
+        // Status: đang search
+        this._setEngineStat('status', 'Đang search...', 'loading');
+    },
+
+    _setEngineStat(name, value, cls) {
+        const el = document.getElementById('engine-stat-' + name);
+        if (!el) return;
+        el.textContent = value;
+        if (cls !== undefined) {
+            el.classList.remove('loading', 'ready', 'error');
+            if (cls) el.classList.add(cls);
+        }
+    },
+
+    _formatNumber(n) {
+        if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+        if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+        if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+        return String(n);
+    },
+
+    _formatTime(ms) {
+        if (ms < 1000) return ms + 'ms';
+        return (ms / 1000).toFixed(2) + 's';
     },
 
     // ===== UCI parsing helpers (cho local Stockfish mode) =====
