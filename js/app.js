@@ -2781,14 +2781,22 @@ const Analysis = {
         this.stopEngine();
     },
 
-    // ===== Engine mode: lite, full, hoặc nexus =====
+    // ===== Engine mode: lite, full, nexus, nexus-high =====
     getEngineMode() {
         const g = window.game;
         if (!g || !g.settings) return 'lite';
         const mode = g.settings.engine;
         if (mode === 'full') return 'full';
         if (mode === 'nexus') return 'nexus';
+        if (mode === 'nexus-high') return 'nexus-high';
         return 'lite';
+    },
+    // Get depth for engine mode
+    getEngineDepth() {
+        const mode = this.getEngineMode();
+        if (mode === 'nexus') return 22;      // Nexus Low: depth 18-24
+        if (mode === 'nexus-high') return 35;  // Nexus High: depth 35-40
+        return 18;                              // Stockfish: depth 18
     },
 
     ensureEngine() {
@@ -2875,7 +2883,7 @@ const Analysis = {
         if (mode === 'lite') {
             return Promise.resolve({ url: 'stockfish/stockfish-18-lite-single.js', revokeUrl: null });
         }
-        if (mode === 'nexus') {
+        if (mode === 'nexus' || mode === 'nexus-high') {
             return Promise.resolve({ url: 'nexus/nexus-worker.js', revokeUrl: null });
         }
         // Full mode: thử IndexedDB cache, fallback CDN
@@ -3020,9 +3028,10 @@ const Analysis = {
             } catch (e) { break; }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
-        const isNexus = this._engineMode === 'nexus';
+        const isNexus = this._engineMode === 'nexus' || this._engineMode === 'nexus-high';
+        const depth = this.getEngineDepth();
         this.engine.postMessage(cmd);
-        this.engine.postMessage('go depth 18');
+        this.engine.postMessage('go depth ' + depth);
         if (isNexus) this.engine.postMessage('quit'); // Nexus needs quit to end UCI loop
         const _bm = document.getElementById('analysis-bestmove');
         if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
@@ -3610,8 +3619,11 @@ const Analysis = {
             }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
+        const isNexus2 = this._engineMode === 'nexus' || this._engineMode === 'nexus-high';
+        const depth2 = this.getEngineDepth();
         this.engine.postMessage(cmd);
-        this.engine.postMessage('go depth 18');
+        this.engine.postMessage('go depth ' + depth2);
+        if (isNexus2) this.engine.postMessage('quit');
         const _bm = document.getElementById('analysis-bestmove');
         if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
     },
