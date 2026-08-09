@@ -2835,7 +2835,7 @@ const Analysis = {
                     msg = elapsed <= 60
                         ? `⏳ Đang compile WASM (108MB)... đã ${elapsed}s`
                         : elapsed <= 180
-                        ? `⏳ Vẫn đang compile... đã ${elapsed}s. iPhone 12 Pro có thể mất 2-4 phút.`
+                        ? `⏳ Vẫn đang compile... đã ${elapsed}s. Vui lòng đợi thêm.`
                         : `⏳ Đã ${elapsed}s — nếu quá lâu, thử đóng và mở lại Analysis, hoặc dùng bản Lite.`;
                 } else {
                     msg = `⏳ Đang load Lite... đã ${elapsed}s`;
