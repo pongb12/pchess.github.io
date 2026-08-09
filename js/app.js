@@ -3738,18 +3738,11 @@ const Analysis = {
         const afterCp = this.cpOf(after.score);
         if (bestCp == null || afterCp == null) return null;
 
-        // Tính EP (Expected Points) từ góc nhìn PLAYER vừa đi
-        // ply lẻ = Trắng đi, ply chẵn = Đen đi
-        let epBefore, epAfter;
-        if (i % 2 === 1) {
-            // Trắng đi: before = bestCp (góc nhìn Trắng), after = -afterCp (góc nhìn Trắng sau khi Đen response)
-            epBefore = this.expectedPoints(bestCp);
-            epAfter = this.expectedPoints(-afterCp);
-        } else {
-            // Đen đi: before = -bestCp (góc nhìn Đen), after = afterCp (góc nhìn Đen)
-            epBefore = this.expectedPoints(-bestCp);
-            epAfter = this.expectedPoints(afterCp);
-        }
+        // EP (Expected Points) từ góc nhìn PLAYER vừa đi
+        // Eval trước nước (before) = góc nhìn side-to-move = player vừa đi → dùng trực tiếp
+        // Eval sau nước (after) = góc nhìn opponent → đổi dấu
+        const epBefore = this.expectedPoints(bestCp);
+        const epAfter = this.expectedPoints(-afterCp);
         if (epBefore == null || epAfter == null) return null;
 
         // EP loss = EP trước nước - EP sau nước (0-1, clamp >= 0)
@@ -3797,15 +3790,9 @@ const Analysis = {
                 const oppBestCp = this.cpOf(oppBefore.score);
                 const oppAfterCp = this.cpOf(oppAfter.score);
                 if (oppBestCp != null && oppAfterCp != null) {
-                    // Tính EP loss của đối thủ
-                    let oppEpBefore, oppEpAfter;
-                    if ((i - 1) % 2 === 1) {
-                        oppEpBefore = this.expectedPoints(oppBestCp);
-                        oppEpAfter = this.expectedPoints(-oppAfterCp);
-                    } else {
-                        oppEpBefore = this.expectedPoints(-oppBestCp);
-                        oppEpAfter = this.expectedPoints(oppAfterCp);
-                    }
+                    // Same formula: before = player POV, after = opponent POV (negate)
+                    const oppEpBefore = this.expectedPoints(oppBestCp);
+                    const oppEpAfter = this.expectedPoints(-oppAfterCp);
                     if (oppEpBefore != null && oppEpAfter != null) {
                         const oppEpLoss = Math.max(0, oppEpBefore - oppEpAfter);
                         // Đối thủ blunder (EP loss > 0.20) + bạn có cơ hội thắng (epBefore >= 0.7)
@@ -3844,26 +3831,21 @@ const Analysis = {
 
         // ===== Eval bar: dùng sigmoid win% (chuẩn Lichess/Chess.com) =====
         // Eval bar thể hiện % thắng của Trắng (trên = Trắng, dưới = Đen).
-        // - cp = 0 → 50% (cân bằng)
-        // - cp = +100 → ~64% (Trắng lợi thế nhẹ)
-        // - cp = +300 → ~85% (Trắng lợi thế lớn)
-        // - cp = -100 → ~36% (Đen lợi thế nhẹ)
-        // - mate +N → ~100% (Trắng chiếu hết)
-        // - mate -N → ~0% (Đen chiếu hết)
         //
-        // QUAN TRỌNG: eval sau nước lẻ (Đen đi) là từ góc nhìn Đen (đối phương).
-        // Cần đổi dấu để quy về góc nhìn Trắng.
+        // Stockfish trả eval từ góc nhìn side-to-move (người SẼ đi tiếp).
+        // Eval sau nước ply = góc nhìn ĐỐI THỦ của người vừa đi.
+        // Để quy về góc nhìn TRẮNG:
+        //   - ply chẵn (Trắng sẽ đi): eval đã là góc nhìn Trắng → dùng trực tiếp
+        //   - ply lẻ (Đen sẽ đi): eval là góc nhìn Đen → đổi dấu
         const fill = document.getElementById('analysis-eval-fill');
         let whiteWinPct; // 0-100, % thắng của Trắng
         let cp = ev.score.type === 'cp' ? ev.score.value : 0;
-        // ply lẻ = sau nước của Trắng (Trắng vừa đi, eval là góc nhìn Đen)
-        // → đổi dấu để quy về Trắng
+        // ply lẻ = Đen sẽ đi tiếp → eval là góc nhìn Đen → đổi dấu
         if (ply % 2 === 1) cp = -cp;
 
         if (ev.score.type === 'mate') {
-            // Mate: quy về góc nhìn Trắng
             let mateVal = ev.score.value;
-            if (ply % 2 === 1) mateVal = -mateVal; // Đen vừa đi
+            if (ply % 2 === 1) mateVal = -mateVal; // Đen sẽ đi → đổi dấu
             whiteWinPct = mateVal > 0 ? 100 : 0;
         } else {
             // Sigmoid: cp → % thắng của Trắng
