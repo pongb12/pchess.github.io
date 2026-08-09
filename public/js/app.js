@@ -2820,6 +2820,8 @@ const Analysis = {
             this._engineStartTime = Date.now();
             this._setEngineStat('mode', mode);
             this._setEngineStat('status', 'Đang tải...', 'loading');
+            // Hiện load progress bar (Full mode)
+            this._showLoadProgress(mode === 'full');
             // Cập nhật analysis-bestmove để hiện progress load
             const bestmoveEl = document.getElementById('analysis-bestmove');
             if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải Stockfish ${mode}...</span>`;
@@ -2844,6 +2846,8 @@ const Analysis = {
                 this._setEngineStat('status', msg.replace('⏳ ', ''), 'loading');
                 this._setEngineStat('time', this._formatTime(elapsed * 1000));
                 if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">${msg}</span>`;
+                // Update progress bar (ước tính dựa trên thời gian)
+                this._updateLoadProgress(elapsed, mode);
             }, 5000);
 
             // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
@@ -2923,6 +2927,7 @@ const Analysis = {
         if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this.setEngineStatus('⚠️ ' + msg, true);
         this._setEngineStat('status', 'Lỗi: ' + msg.substring(0, 60), 'error');
+        this._hideLoadProgress();
         if (this.engine) {
             try { this.engine.terminate(); } catch (e) { /* ignore */ }
             this.engine = null;
@@ -3039,6 +3044,7 @@ const Analysis = {
             this.setEngineStatus('Stockfish sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', mode ' + (this._engineMode || '?') + ')');
             this._setEngineStat('status', 'Ready', 'ready');
             this._setEngineStat('mode', this._engineMode || '?');
+            this._hideLoadProgress();
             this.analyzeCurrent();
             if (this.pendingStartAfterReady) {
                 this.pendingStartAfterReady = false;
@@ -3157,6 +3163,52 @@ const Analysis = {
     _formatTime(ms) {
         if (ms < 1000) return ms + 'ms';
         return (ms / 1000).toFixed(2) + 's';
+    },
+
+    // ===== Load Progress Bar =====
+    // Ước tính % load dựa trên thời gian (vì Stockfish không có callback % load chính xác).
+    // Full mode: ước tính 180s để compile (thực tế có thể 30s-8 phút tùy thiết bị)
+    // Lite mode: ước tính 30s
+    _showLoadProgress(show) {
+        const wrap = document.getElementById('load-progress-wrap');
+        if (!wrap) return;
+        if (show) {
+            wrap.style.display = 'flex';
+            this._updateLoadProgress(0, this._engineMode);
+        } else {
+            wrap.style.display = 'none';
+        }
+    },
+
+    _updateLoadProgress(elapsedSec, mode) {
+        const fill = document.getElementById('load-progress-fill');
+        const text = document.getElementById('load-progress-text');
+        if (!fill || !text) return;
+
+        // Ước tính thời gian load tối đa
+        const maxSec = (mode === 'full') ? 180 : 30; // 180s cho Full, 30s cho Lite
+        let pct = Math.min(95, (elapsedSec / maxSec) * 100); // cap 95% (đợi readyok mới 100%)
+
+        // Slow down progress khi gần 90% để tạo cảm giác "gần xong"
+        if (pct > 90) pct = 90 + (pct - 90) * 0.3;
+
+        fill.style.width = pct.toFixed(0) + '%';
+        text.textContent = pct.toFixed(0) + '%';
+    },
+
+    _hideLoadProgress() {
+        const wrap = document.getElementById('load-progress-wrap');
+        if (!wrap) return;
+        // Set 100% trước khi ẩn (hiệu ứng "xong")
+        const fill = document.getElementById('load-progress-fill');
+        const text = document.getElementById('load-progress-text');
+        if (fill) fill.style.width = '100%';
+        if (text) text.textContent = '100%';
+        setTimeout(() => {
+            wrap.style.display = 'none';
+            if (fill) fill.style.width = '0%';
+            if (text) text.textContent = '0%';
+        }, 800);
     },
 
     // ===== UCI parsing helpers (cho local Stockfish mode) =====

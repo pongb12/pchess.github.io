@@ -1592,6 +1592,55 @@ html, body {
     text-align: center;
 }
 
+/* ===== Load Progress Bar (cho Stockfish Full) ===== */
+.load-progress-wrap {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.load-progress-bar {
+    flex: 1;
+    height: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid var(--board-border);
+}
+.load-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+    border-radius: 4px;
+    transition: width 0.5s ease;
+    position: relative;
+    overflow: hidden;
+}
+.load-progress-fill::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.4) 50%,
+        transparent 100%
+    );
+    animation: load-shimmer 1.5s infinite;
+}
+@keyframes load-shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+}
+.load-progress-text {
+    min-width: 40px;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--accent);
+}
+
 /* ===== Engine Stats Panel (depth, nodes, nps, time) ===== */
 .engine-stats {
     margin-top: 8px;
