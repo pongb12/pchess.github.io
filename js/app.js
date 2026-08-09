@@ -3656,18 +3656,52 @@ const Analysis = {
         this.goTo(this.batchQueue.shift());
     },
 
-    // ===== Phân loại nước đi (kiểu Chess.com — Expected Points model) =====
+    // ===== Chess.com Classification V2 + CAPS2-style Accuracy =====
+    // Reference: Chess.com official docs (2026)
+    //
+    // EP (Expected Points) = win probability (0-1) từ góc nhìn player
+    //   EP = 1/(1+exp(-0.00368208*cp))
+    //
+    // EP loss = EP(before best move) - EP(after played move)
+    //
+    // Classification V2 thresholds (EP loss):
+    //   Best:       0.00
+    //   Excellent:  0.00 – 0.02
+    //   Good:       0.02 – 0.05
+    //   Inaccuracy: 0.05 – 0.10
+    //   Mistake:    0.10 – 0.20
+    //   Blunder:    > 0.20
+    //
+    // Special overrides:
+    //   Brilliant: best/near-best + sacrifice + not already winning
+    //   Great: game-changing (lose→draw, draw→win)
+    //   Miss: opponent blundered, you had winning chance but didn't take it
+    //   Book: opening moves (<=10 ply)
+    //
+    // CAPS2-style accuracy:
+    //   per-move: 100 * exp(-3 * epLoss) → range 0-100
+    //   game: average of per-move accuracies
+    //   Typical amateur: 60-85%, not clustered near 100
+
     cpOf(score) {
         if (!score) return null;
         if (score.type === 'mate') return score.value > 0 ? 100000 - score.value : -(100000 + score.value);
         return score.value;
     },
 
+    // Expected Points: cp → EP (0-1) từ góc nhìn player
+    expectedPoints(cp) {
+        if (cp == null) return null;
+        if (cp >= 100000) return 1.0;
+        if (cp <= -100000) return 0.0;
+        return 1 / (1 + Math.exp(-0.00368208 * cp));
+    },
+
+    // Giữ winPct cho backward compat (chart, eval bar)
     winPct(cp) {
         if (cp == null) return null;
         if (cp >= 100000) return 100;
         if (cp <= -100000) return 0;
-        // Sigmoid: centipawn -> % thắng (cùng dạng Lichess/Chess.com)
         return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
     },
 
@@ -3695,21 +3729,7 @@ const Analysis = {
         return ch;
     },
 
-    // ===== Classification theo Lichess lila algorithm (canonical) =====
-    // Reference: lila/modules/analyse/src/eval/Advantage.scala + Score.scala
-    // Lila dùng sigmoid win% với constant 0.00368208 (Lichess standard).
-    // Accuracy: 103.1668 * exp(-0.04354 * (winBefore - winBest)) - 3.1669, clamp [0,100]
-    // Labels dựa trên win% drop (delta = winBefore - winAfter):
-    //   - Book: <=10 ply, near opening
-    //   - Brilliant: isBest + sacrifice + winAfter tốt
-    //   - Great: isBest + rescue
-    //   - Best: đúng top PV
-    //   - Excellent: delta <= 0.5
-    //   - Good: delta <= 2
-    //   - Inaccuracy: delta <= 5
-    //   - Mistake: delta <= 10
-    //   - Blunder: delta > 10
-    //   - Missed: bỏ lỡ mate/win rõ ràng
+    // ===== Classification V2 (Chess.com standard, Expected Points model) =====
     classifyMove(i) {
         const before = this.evals[i - 1];
         const after = this.evals[i];
@@ -3717,69 +3737,94 @@ const Analysis = {
         const bestCp = this.cpOf(before.score);
         const afterCp = this.cpOf(after.score);
         if (bestCp == null || afterCp == null) return null;
-        // winPct từ góc nhìn PLAYER vừa đi (chuẩn Lichess)
-        // ply lẻ = Trắng đi → wb = winPct(bestCp), wa = winPct(-afterCp)
-        // ply chẵn = Đen đi → wb = winPct(-bestCp), wa = winPct(afterCp)
-        let wb, wa;
+
+        // Tính EP (Expected Points) từ góc nhìn PLAYER vừa đi
+        // ply lẻ = Trắng đi, ply chẵn = Đen đi
+        let epBefore, epAfter;
         if (i % 2 === 1) {
-            wb = this.winPct(bestCp);
-            wa = this.winPct(-afterCp);
+            // Trắng đi: before = bestCp (góc nhìn Trắng), after = -afterCp (góc nhìn Trắng sau khi Đen response)
+            epBefore = this.expectedPoints(bestCp);
+            epAfter = this.expectedPoints(-afterCp);
         } else {
-            wb = this.winPct(-bestCp);
-            wa = this.winPct(afterCp);
+            // Đen đi: before = -bestCp (góc nhìn Đen), after = afterCp (góc nhìn Đen)
+            epBefore = this.expectedPoints(-bestCp);
+            epAfter = this.expectedPoints(afterCp);
         }
-        if (wb == null || wa == null) return null;
-        // delta = winBefore - winAfter (mất bao nhiêu % thắng)
-        // Nếu player đi tốt hơn best (wa > wb) → delta âm → vẫn tính là Best
-        const delta = Math.max(0, wb - wa); // clamp >= 0 để accuracy không > 100%
+        if (epBefore == null || epAfter == null) return null;
+
+        // EP loss = EP trước nước - EP sau nước (0-1, clamp >= 0)
+        const epLoss = Math.max(0, epBefore - epAfter);
 
         const moverColor = (i - 1) % 2 === 0 ? 'w' : 'b';
         const bestSan = before.pv && before.pv[0];
         const playedSan = this.pgnMoves[i - 1];
         const isBest = !!bestSan && bestSan === playedSan;
 
-        // Lưu wb/wa để dùng cho accuracy calculation
-        const winBefore = wb;
-        const winAfter = wa;
+        // Lưu EP để dùng cho accuracy
+        const ep = { before: epBefore, after: epAfter, loss: epLoss };
 
-        // Book: nước đầu (<=10 ply) gần đúng khai cuộc
-        if (i <= this.BOOK_PLY && delta <= 5) return { label: 'Book', delta, winBefore, winAfter };
+        // ===== Book: nước khai cuộc (<=10 ply) =====
+        if (i <= this.BOOK_PLY && epLoss <= 0.05) return { label: 'Book', delta: epLoss * 100, ep };
 
-        // ===== Brilliant (!!): sacrifice material + isBest + winAfter tốt =====
-        if (isBest && winAfter >= 50) {
+        // ===== Brilliant (!!): best/near-best + sacrifice + not already winning =====
+        // Chess.com: nước tốt nhất + hy sinh quân + kết quả không xấu + chưa hoàn toàn thắng trước đó
+        if (isBest && epAfter >= 0.5) { // result not bad (>= 50% win)
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
             const matLost = bal0 - bal1;
-            if (matLost >= 1.5 && (winAfter >= 60 || (after.score && after.score.type === 'mate' && after.score.value > 0))) {
-                return { label: 'Brilliant', delta, winBefore, winAfter };
+            // Sacrifice >= 1.5 pawns + wasn't already completely winning (epBefore < 0.95)
+            if (matLost >= 1.5 && epBefore < 0.95 && epAfter >= 0.6) {
+                return { label: 'Brilliant', delta: epLoss * 100, ep };
             }
         }
 
-        // ===== Great (!): rescue từ thế khó → cầm cờ/thắng =====
-        if (delta <= 2 && ((winBefore <= 30 && winAfter >= 50) || (winBefore <= 50 && winAfter >= 75))) {
-            return { label: 'Great', delta, winBefore, winAfter };
+        // ===== Great (!): game-changing move =====
+        // Chess.com: chuyển kết quả ván (thua→hòa, hòa→thắng) hoặc chỉ có 1 nước tốt để cứu
+        if (epLoss <= 0.02) {
+            // Lose → Draw: was losing (ep < 0.3), now draw/win (ep >= 0.5)
+            if (epBefore < 0.3 && epAfter >= 0.5) return { label: 'Great', delta: epLoss * 100, ep };
+            // Draw → Win: was drawish (0.3-0.6), now winning (>= 0.75)
+            if (epBefore < 0.6 && epAfter >= 0.75) return { label: 'Great', delta: epLoss * 100, ep };
         }
 
-        // ===== Best: đúng nước engine đề xuất =====
-        if (isBest) return { label: 'Best', delta, winBefore, winAfter };
+        // ===== Miss: đối thủ mắc sai lầm, bạn bỏ lỡ cơ hội =====
+        // Chess.com: nhìn nước của đối thủ trước đó — nếu đối thủ blunder,
+        // bạn có cơ hội thắng nhưng không tận dụng
+        if (i >= 2) {
+            const oppBefore = this.evals[i - 2];
+            const oppAfter = this.evals[i - 1];
+            if (oppBefore && oppAfter && oppBefore.score && oppAfter.score) {
+                const oppBestCp = this.cpOf(oppBefore.score);
+                const oppAfterCp = this.cpOf(oppAfter.score);
+                if (oppBestCp != null && oppAfterCp != null) {
+                    // Tính EP loss của đối thủ
+                    let oppEpBefore, oppEpAfter;
+                    if ((i - 1) % 2 === 1) {
+                        oppEpBefore = this.expectedPoints(oppBestCp);
+                        oppEpAfter = this.expectedPoints(-oppAfterCp);
+                    } else {
+                        oppEpBefore = this.expectedPoints(-oppBestCp);
+                        oppEpAfter = this.expectedPoints(oppAfterCp);
+                    }
+                    if (oppEpBefore != null && oppEpAfter != null) {
+                        const oppEpLoss = Math.max(0, oppEpBefore - oppEpAfter);
+                        // Đối thủ blunder (EP loss > 0.20) + bạn có cơ hội thắng (epBefore >= 0.7)
+                        // nhưng bạn không tận dụng (epLoss > 0.05)
+                        if (oppEpLoss > 0.20 && epBefore >= 0.7 && epLoss > 0.05) {
+                            return { label: 'Missed', delta: epLoss * 100, ep };
+                        }
+                    }
+                }
+            }
+        }
 
-        // ===== Missed: bỏ lỡ cơ hội thắng rõ ràng =====
-        if (delta >= 5 && winBefore >= 80) return { label: 'Missed', delta, winBefore, winAfter };
-
-        // ===== Excellent: delta <= 0.5 (gần như best) =====
-        if (delta <= 0.5) return { label: 'Excellent', delta, winBefore, winAfter };
-
-        // ===== Good: delta <= 2 =====
-        if (delta <= 2) return { label: 'Good', delta, winBefore, winAfter };
-
-        // ===== Inaccuracy: delta <= 5 =====
-        if (delta <= 5) return { label: 'Inaccuracy', delta, winBefore, winAfter };
-
-        // ===== Mistake: delta <= 10 =====
-        if (delta <= 10) return { label: 'Mistake', delta, winBefore, winAfter };
-
-        // ===== Blunder: delta > 10 =====
-        return { label: 'Blunder', delta, winBefore, winAfter };
+        // ===== Classification V2 (EP loss thresholds) =====
+        if (epLoss === 0) return { label: 'Best', delta: 0, ep };
+        if (epLoss <= 0.02) return { label: 'Excellent', delta: epLoss * 100, ep };
+        if (epLoss <= 0.05) return { label: 'Good', delta: epLoss * 100, ep };
+        if (epLoss <= 0.10) return { label: 'Inaccuracy', delta: epLoss * 100, ep };
+        if (epLoss <= 0.20) return { label: 'Mistake', delta: epLoss * 100, ep };
+        return { label: 'Blunder', delta: epLoss * 100, ep };
     },
 
     classify() {
@@ -3974,24 +4019,21 @@ const Analysis = {
         const container = document.getElementById('analysis-classification-stats');
         if (!container) return;
 
-        // Tính accuracy theo per-move (chuẩn Lichess lila):
-        // accuracy = 103.1668 * exp(-0.04354 * (wb - wa)) - 3.1669
-        // wb = winPct trước nước (từ góc nhìn player)
-        // wa = winPct sau nước (từ góc nhìn player)
-        // Nếu wa >= wb (player đi tốt hơn best) → accuracy = 100%
+        // ===== CAPS2-style Accuracy =====
+        // Chess.com CAPS2: per-move accuracy = 100 * exp(-3 * epLoss)
+        // Game accuracy = average of per-move accuracies
+        // Range: 50-95 for typical games (not clustered near 100)
         const whiteAccuracies = [];
         const blackAccuracies = [];
         const whiteCounts = {};
         const blackCounts = {};
         for (let i = 1; i <= this.pgnMoves.length; i++) {
             const c = this.classifications[i];
-            if (c && c.winBefore !== undefined && c.winAfter !== undefined) {
-                const wb = c.winBefore;
-                const wa = c.winAfter;
-                // Per-move accuracy theo lila
+            if (c && c.ep && c.ep.loss !== undefined) {
+                // Per-move CAPS2 accuracy
                 let acc;
-                if (wa >= wb) acc = 100; // player đi bằng hoặc tốt hơn best
-                else acc = 103.1668 * Math.exp(-0.04354 * (wb - wa)) - 3.1669;
+                if (c.ep.loss === 0) acc = 100;
+                else acc = 100 * Math.exp(-3 * c.ep.loss);
                 acc = Math.max(0, Math.min(100, acc));
 
                 if (i % 2 === 1) {
@@ -4004,7 +4046,6 @@ const Analysis = {
             }
         }
 
-        // Accuracy trung bình = trung bình per-move accuracy
         const avgAcc = (accs) => {
             if (!accs.length) return 0;
             return Math.round(accs.reduce((a, b) => a + b, 0) / accs.length);
