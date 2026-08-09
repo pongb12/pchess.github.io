@@ -2729,7 +2729,7 @@ const Analysis = {
         this.index = -1;
         this.failed = false;
         this.pendingStartAfterReady = false;
-        this.setEngineStatus('Đang tải Stockfish...');
+        this.setEngineStatus('Đang tải ' + this.getEngineLabel() + '...');
         this.ensureEngine();
         this.goTo(0);
     },
@@ -2755,7 +2755,7 @@ const Analysis = {
             this.pendingStartAfterReady = false;
             document.getElementById('pgn-modal').classList.add('hidden');
             document.getElementById('pgn-input').value = '';
-            this.setEngineStatus('Đang tải Stockfish...');
+            this.setEngineStatus('Đang tải ' + this.getEngineLabel() + '...');
             this.ensureEngine();
             this.goTo(0);
             this.show();
@@ -2798,18 +2798,34 @@ const Analysis = {
         if (mode === 'nexus-high') return 35;  // Nexus High: depth 35-40
         return 18;                              // Stockfish: depth 18
     },
+    // Get engine label for display
+    getEngineLabel() {
+        const mode = this._engineMode || this.getEngineMode();
+        if (mode === 'nexus') return 'Nexus 6.1 Low';
+        if (mode === 'nexus-high') return 'Nexus 6.1 High';
+        if (mode === 'full') return 'Stockfish Full';
+        return 'Stockfish Lite';
+    },
+    isNexus() {
+        const mode = this._engineMode || this.getEngineMode();
+        return mode === 'nexus' || mode === 'nexus-high';
+    },
 
     ensureEngine() {
         if (this.engine || this.failed) return;
         const mode = this.getEngineMode();
-        this.setEngineStatus('Đang tải Stockfish ' + mode + '...');
+        this.setEngineStatus('Đang tải ' + this.getEngineLabel() + '...');
         const gen = ++this._gen;
         this._engineMode = mode;
         this.engineUrl().then((res) => {
             if (gen !== this._gen || this.engine || this.failed) return;
-            this.setEngineStatus(mode === 'full'
-                ? 'Đang khởi tạo Worker bản Full (~108MB WASM — có thể mất 30-120s)...'
-                : 'Đang khởi tạo Worker bản Lite...');
+            if (mode === 'full') {
+                this.setEngineStatus('Đang khởi tạo Worker bản Full (~108MB WASM — có thể mất 30-120s)...');
+            } else if (this.isNexus()) {
+                this.setEngineStatus('Đang khởi tạo ' + this.getEngineLabel() + ' (~25MB WASM)...');
+            } else {
+                this.setEngineStatus('Đang khởi tạo Worker bản Lite...');
+            }
             try {
                 this.engine = new Worker(res.url);
                 this.engineUrlValue = res.revokeUrl;
@@ -2819,11 +2835,14 @@ const Analysis = {
             }
             this.engine.onerror = (e) => {
                 const msg = e.message || (e.filename ? ('tại ' + e.filename.split('/').pop() + ':' + e.lineno) : 'worker error');
-                this.engineFailed('Stockfish lỗi: ' + msg);
+                this.engineFailed(this.getEngineLabel() + ' lỗi: ' + msg);
                 return;
             };
             this.engine.onmessage = (e) => this.onEngineMessage(e.data);
-            this.engine.postMessage('uci');
+            // Nexus worker tự gửi 'NEXUS_READY', không cần gửi 'uci' ngay
+            if (!this.isNexus()) {
+                this.engine.postMessage('uci');
+            }
 
             if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
             // Heartbeat cập nhật status mỗi 5s để user biết engine đang compile
@@ -2834,7 +2853,7 @@ const Analysis = {
             // Hiện load progress bar (Full mode)
             this._showLoadProgress(mode === 'full');
             // Cập nhật analysis-bestmove để hiện progress load
-            const engineName = mode === 'nexus' ? 'Nexus 6.1' : 'Stockfish ' + mode;
+            const engineName = this.getEngineLabel();
             const bestmoveEl = document.getElementById('analysis-bestmove');
             if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải ${engineName}...</span>`;
             this._heartbeatTimer = setInterval(() => {
@@ -2864,12 +2883,12 @@ const Analysis = {
 
             // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
             // Lite chỉ cần 30s
-            const timeout = (mode === 'full') ? 480000 : 30000; // 8 phút / 30s
+            const timeout = (mode === 'full') ? 480000 : (this.isNexus() ? 60000 : 30000); // 8 phút / 60s Nexus / 30s Lite
             if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
             this._watchdogTimer = setTimeout(() => {
                 if (gen !== this._gen) return;
                 if (!this.ready && !this.failed) {
-                    this.engineFailed('Stockfish không phản hồi sau ' + (timeout / 1000) + 's. Thử lại với bản Lite.');
+                    this.engineFailed(this.getEngineLabel() + ' không phản hồi sau ' + (timeout / 1000) + 's. Thử lại với bản Lite.');
                 }
             }, timeout);
         }).catch((err) => {
@@ -2980,7 +2999,7 @@ const Analysis = {
         this._gen++;
     },
 
-    // ===== Start full analysis (local Stockfish) =====
+    // ===== Start full analysis (local engine) =====
     startFullAnalysis() {
         if (!this.pgnMoves.length) {
             showToast('Chưa có ván cờ nào để phân tích', 'warning');
@@ -2991,7 +3010,7 @@ const Analysis = {
             return;
         }
         if (this.failed) {
-            showToast('Stockfish không hoạt động, thử lại sau', 'warning');
+            showToast(this.getEngineLabel() + ' không hoạt động, thử lại sau', 'warning');
             return;
         }
         if (!this.ready) {
@@ -3060,7 +3079,7 @@ const Analysis = {
         if (data === 'uciok') {
             this.engine.postMessage('setoption name MultiPV value ' + this.MULTI_PV_COUNT);
             this.engine.postMessage('isready');
-            this.setEngineStatus('Đang chờ Stockfish ready...');
+            this.setEngineStatus('Đang chờ ' + this.getEngineLabel() + ' ready...');
             this._setEngineStat('status', 'UCI OK — đang ready', 'loading');
             return;
         }
@@ -3068,7 +3087,7 @@ const Analysis = {
             this.ready = true;
             this.failed = false;
             if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-            this.setEngineStatus('Stockfish sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', mode ' + (this._engineMode || '?') + ')');
+            this.setEngineStatus(this.getEngineLabel() + ' sẵn sàng (Multi-PV ' + this.MULTI_PV_COUNT + ', depth ' + this.getEngineDepth() + ')');
             this._setEngineStat('status', 'Ready', 'ready');
             this._setEngineStat('mode', this._engineMode || '?');
             this._hideLoadProgress();
@@ -3288,7 +3307,7 @@ const Analysis = {
     // ===== Local batch analysis (cho lite/full mode) =====
     analyzeAll() {
         if (!this.ready) {
-            showToast('Stockfish chưa sẵn sàng', 'warning');
+            showToast(this.getEngineLabel() + ' chưa sẵn sàng', 'warning');
             return;
         }
         if (!this.pgnMoves.length) {
@@ -3639,13 +3658,13 @@ const Analysis = {
             return;
         }
         if (this.failed) {
-            showToast('Stockfish không hoạt động, thử lại sau', 'warning');
+            showToast(this.getEngineLabel() + ' không hoạt động, thử lại sau', 'warning');
             return;
         }
         if (!this.ready) {
             // Chưa tải xong engine: chờ readyok rồi tự chạy phân tích toàn bộ
             if (!this.engine) {
-                this.setEngineStatus('Đang tải Stockfish...');
+                this.setEngineStatus('Đang tải ' + this.getEngineLabel() + '...');
                 this.ensureEngine();
             }
             this.pendingStartAfterReady = true;
@@ -3656,7 +3675,7 @@ const Analysis = {
 
     analyzeAll() {
         if (!this.ready) {
-            showToast('Stockfish chưa sẵn sàng, thử lại sau', 'warning');
+            showToast(this.getEngineLabel() + ' chưa sẵn sàng, thử lại sau', 'warning');
             return;
         }
         if (!this.pgnMoves.length) {
