@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pchess
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server-render.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.0.0
+    healthCheckPath: /
+    autoDeploy: true
+    domains:
+      - pchess.onrender.com
