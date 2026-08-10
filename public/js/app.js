@@ -2786,35 +2786,45 @@ const Analysis = {
         const g = window.game;
         if (!g || !g.settings) return 'lite';
         const e = g.settings.engine;
-        if (e === 'full' || e === 'nexus' || e === 'nexus-high') return e;
+        if (e === 'full' || e === 'nexus' || e === 'nexus-high' || e === 'nexus-web' || e === 'nexus-web-high') return e;
         return 'lite';
     },
 
     isNexus() {
         const mode = this._engineMode || this.getEngineMode();
-        return mode === 'nexus' || mode === 'nexus-high';
+        return mode === 'nexus' || mode === 'nexus-high' || mode === 'nexus-web' || mode === 'nexus-web-high';
     },
 
     getEngineDepth() {
         const mode = this._engineMode || this.getEngineMode();
-        if (mode === 'nexus') return 12;
-        if (mode === 'nexus-high') return 30;  // hạ từ 35 → 30 (depth 35 quá lâu)
-        // Stockfish Lite/Full: adaptive depth 19-22 theo game phase
-        // - Opening (ply 0-12): depth 22 — khai cuộc quan trọng, search sâu
-        // - Early middle (ply 13-30): depth 21
-        // - Middle/late (ply 31-50): depth 20
-        // - Endgame (ply 51+): depth 19 — position đơn giản hơn, search nhanh
         const ply = this.index || 0;
-        if (ply <= 12) return 22;
-        if (ply <= 30) return 21;
-        if (ply <= 50) return 20;
-        return 19;
+        // Nexus web-analysis (pthreads): Low 14-18, High 22-26
+        if (mode === 'nexus-web') {
+            if (ply <= 12) return 18;
+            if (ply <= 30) return 16;
+            return 14;
+        }
+        if (mode === 'nexus-web-high') {
+            if (ply <= 12) return 26;
+            if (ply <= 30) return 24;
+            return 22;
+        }
+        // Nexus single-threaded (old): Low 12, High 30
+        if (mode === 'nexus') return 12;
+        if (mode === 'nexus-high') return 30;
+        // Stockfish Lite/Full: adaptive depth 16-21 theo game phase
+        if (ply <= 12) return 21;
+        if (ply <= 30) return 20;
+        if (ply <= 50) return 18;
+        return 16;
     },
 
     getEngineLabel() {
         const mode = this._engineMode || this.getEngineMode();
         if (mode === 'nexus') return 'Nexus 6.1 Low';
         if (mode === 'nexus-high') return 'Nexus 6.1 High';
+        if (mode === 'nexus-web') return 'Nexus 6.1 Web Low';
+        if (mode === 'nexus-web-high') return 'Nexus 6.1 Web High';
         if (mode === 'full') return 'Stockfish Full';
         return 'Stockfish Lite';
     },
@@ -2915,6 +2925,9 @@ const Analysis = {
         }
         if (mode === 'nexus' || mode === 'nexus-high') {
             return Promise.resolve({ url: 'nexus/nexus-worker.js', revokeUrl: null });
+        }
+        if (mode === 'nexus-web' || mode === 'nexus-web-high') {
+            return Promise.resolve({ url: 'nexus-web/nexus-worker.js', revokeUrl: null });
         }
         // Full mode: thử IndexedDB cache, fallback CDN
         return this._fullEngineUrl();
