@@ -2799,7 +2799,7 @@ const Analysis = {
         const mode = this._engineMode || this.getEngineMode();
         if (mode === 'nexus') return 12;
         if (mode === 'nexus-high') return 30;  // hạ từ 35 → 30 (depth 35 quá lâu)
-        return 18;
+        return 22;  // Stockfish Lite/Full: depth 22 (tăng từ 18, chính xác hơn)
     },
 
     getEngineLabel() {
