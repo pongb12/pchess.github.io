@@ -2882,8 +2882,9 @@ const Analysis = {
             }, 5000);
 
             // Watchdog: Full mode có thể cần đến 8 phút trên iPhone yếu (108MB WASM)
+            // Nexus: engine init (JIT cold start) có thể mất 30s → cần 120s
             // Lite chỉ cần 30s
-            const timeout = (mode === 'full') ? 480000 : (this.isNexus() ? 60000 : 30000); // 8 phút / 60s Nexus / 30s Lite
+            const timeout = (mode === 'full') ? 480000 : (this.isNexus() ? 120000 : 30000);
             if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
             this._watchdogTimer = setTimeout(() => {
                 if (gen !== this._gen) return;
