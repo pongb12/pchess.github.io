@@ -2799,7 +2799,16 @@ const Analysis = {
         const mode = this._engineMode || this.getEngineMode();
         if (mode === 'nexus') return 12;
         if (mode === 'nexus-high') return 30;  // hạ từ 35 → 30 (depth 35 quá lâu)
-        return 22;  // Stockfish Lite/Full: depth 22 (tăng từ 18, chính xác hơn)
+        // Stockfish Lite/Full: adaptive depth 19-22 theo game phase
+        // - Opening (ply 0-12): depth 22 — khai cuộc quan trọng, search sâu
+        // - Early middle (ply 13-30): depth 21
+        // - Middle/late (ply 31-50): depth 20
+        // - Endgame (ply 51+): depth 19 — position đơn giản hơn, search nhanh
+        const ply = this.index || 0;
+        if (ply <= 12) return 22;
+        if (ply <= 30) return 21;
+        if (ply <= 50) return 20;
+        return 19;
     },
 
     getEngineLabel() {
