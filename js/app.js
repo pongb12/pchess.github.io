@@ -2792,11 +2792,12 @@ const Analysis = {
         return 'lite';
     },
     // Get depth for engine mode
+    // Nexus Low depth 12 (~1-2s/move); depth 22 = 7s/move quá chậm
     getEngineDepth() {
         const mode = this.getEngineMode();
-        if (mode === 'nexus') return 22;      // Nexus Low: depth 18-24
-        if (mode === 'nexus-high') return 35;  // Nexus High: depth 35-40
-        return 18;                              // Stockfish: depth 18
+        if (mode === 'nexus') return 12;      // Nexus Low: depth 12 (~1-2s/move)
+        if (mode === 'nexus-high') return 35;  // Nexus High: depth 35 (~30s+/move)
+        return 18;                              // Stockfish: depth 18 (~200ms/move)
     },
     // Get engine label for display
     getEngineLabel() {
@@ -3060,9 +3061,29 @@ const Analysis = {
     // ===== Local engine message handler =====
     onEngineMessage(data) {
         if (typeof data !== 'string') return;
-        // Nexus worker sends 'NEXUS_READY' when module loaded
+        // Nexus worker sends 'NEXUS_READY' when WASM + network loaded
         if (data === 'NEXUS_READY') {
             this._nexusReady = true;
+            this.setEngineStatus(this.getEngineLabel() + ' đã load xong. Đang init engine (1-5s)...');
+            this.engine.postMessage('uci');
+            return;
+        }
+        // Nexus worker sends download progress: 'NEXUS_PROGRESS:network:42'
+        if (data.startsWith('NEXUS_PROGRESS:')) {
+            const parts = data.split(':');
+            if (parts.length === 3) {
+                const pct = parseInt(parts[2], 10);
+                const totalMB = 25;
+                const loadedMB = (totalMB * pct / 100).toFixed(1);
+                this.setEngineStatus(`Đang tải network Nexus (${loadedMB}/${totalMB}MB — ${pct}%)...`);
+                // Update bestmove element too for visibility
+                const bestmoveEl = document.getElementById('analysis-bestmove');
+                if (bestmoveEl) bestmoveEl.innerHTML = `<span class="bestmove-loading">⏳ Đang tải Nexus network: ${pct}%</span>`;
+                // Update load progress bar
+                if (this._setEngineStat) {
+                    this._setEngineStat('status', `Tải network: ${pct}%`, 'loading');
+                }
+            }
             return;
         }
         if (data.startsWith('ERROR:')) {
