@@ -3435,9 +3435,11 @@ const Analysis = {
         { moves: ['e4','e5','Nf3','Nc6','Bc4'], name: 'Italian Game (Ý)', family: 'Open Game' },
         { moves: ['e4','e5','Nf3','Nc6','d4'], name: 'Scotch Game', family: 'Open Game' },
         { moves: ['e4','e5','Nf3','Nc6','Nf6'], name: 'Four Knights Game', family: 'Open Game' },
+        { moves: ['e4','e5','Nf3','d6'], name: 'Philidor Defense', family: 'Open Game' },
         { moves: ['e4','e5','Nf3','d5'], name: 'Elephant Gambit', family: 'Open Game' },
         { moves: ['e4','e5','f4'], name: "King's Gambit (Gambit Vua)", family: 'Open Game' },
         { moves: ['e4','e5','Bc4','Nf6'], name: 'Italian Game, Two Knights Defense', family: 'Open Game' },
+        { moves: ['e4','e5','Bc4','Bc5'], name: 'Italian Game, Giuoco Piano', family: 'Open Game' },
         { moves: ['e4','c5'], name: 'Sicilian Defense (Sicilia)', family: 'Open Game' },
         { moves: ['e4','c5','Nf3','d6','d4','cxd4','Nxd4','Nf6','Nc3'], name: 'Sicilian Defense, Najdorf Variation', family: 'Sicilian' },
         { moves: ['e4','c5','Nf3','d6','d4','cxd4','Nxd4','Nf6','Nc3','g6'], name: 'Sicilian Defense, Dragon Variation', family: 'Sicilian' },
@@ -3453,11 +3455,13 @@ const Analysis = {
         { moves: ['d4','d5','c4','e6'], name: "Queen's Gambit Declined", family: 'Closed Game' },
         { moves: ['d4','d5','c4','c6'], name: 'Slav Defense', family: 'Closed Game' },
         { moves: ['d4','d5','c4','dxc4'], name: "Queen's Gambit Accepted", family: 'Closed Game' },
-        { moves: ['d4','Nf6','c4','g6','Nc3','Bg7'], name: "King's Indian Defense (KID)", family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','e6','Nf3','d5'], name: "Queen's Gambit Declined (D30)", family: 'Closed Game' },
         { moves: ['d4','Nf6','c4','e6','Nc3','Bb4'], name: 'Nimzo-Indian Defense', family: 'Indian Defense' },
         { moves: ['d4','Nf6','c4','e6','Nf3','b6'], name: "Queen's Indian Defense", family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','g6','Nc3','Bg7'], name: "King's Indian Defense (KID)", family: 'Indian Defense' },
         { moves: ['d4','Nf6','c4','c5'], name: 'Benoni Defense', family: 'Indian Defense' },
         { moves: ['d4','Nf6','c4','g6'], name: "King's Indian Defense", family: 'Indian Defense' },
+        { moves: ['d4','Nf6','c4','e6'], name: 'Indian Game (Bogo-Indian setup)', family: 'Indian Defense' },
         { moves: ['d4','f5'], name: 'Dutch Defense', family: 'Closed Game' },
         { moves: ['c4'], name: 'English Opening', family: 'Flank Opening' },
         { moves: ['Nf3'], name: "Réti Opening", family: 'Flank Opening' },
@@ -3493,9 +3497,11 @@ const Analysis = {
 
     detectOpening(movesPlayed) {
         // Tìm opening có prefix dài nhất khớp với movesPlayed.
+        // Match partial: nếu movesPlayed dài hơn opening, vẫn match nếu prefix khớp.
         let best = null;
         let bestLen = 0;
         for (const op of this.OPENINGS) {
+            // Nếu movesPlayed ngắn hơn opening, skip (chưa đủ nước để identify)
             if (movesPlayed.length < op.moves.length) continue;
             let ok = true;
             for (let i = 0; i < op.moves.length; i++) {
@@ -3873,9 +3879,10 @@ const Analysis = {
         const ep = { before: epBefore, after: epAfter, loss: epLoss, cpLoss };
 
         // ===== Book: nước khai cuộc phổ biến (<=10 ply) =====
-        // Chess.com: Book = nước trong opening database
-        // Ở đây: <=10 ply + cpLoss < 30cp + không phải Best → Book
-        if (i <= this.BOOK_PLY && cpLoss < 30 && !isBest) {
+        // Chess.com: Book = nước trong opening database, bất kể có phải best không.
+        // Nếu <=10 ply + cpLoss < 30cp → Book (kể cả khi là Best move)
+        // Chỉ khi cpLoss >= 30 (sai nước khai cuộc) mới classify thường.
+        if (i <= this.BOOK_PLY && cpLoss < 30) {
             return { label: 'Book', delta: epLoss * 100, ep };
         }
 
