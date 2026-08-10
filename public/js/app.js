@@ -3138,15 +3138,25 @@ const Analysis = {
             const depth = this.parseDepth(data);
             if (score != null) {
                 if (!this.evals[ply]) this.evals[ply] = {};
+                // Chỉ update score từ multipv 1, và ưu tiên depth cao nhất
+                // (tránh bị overwrite bởi info depth thấp hơn từ iterative deepening)
                 if (mpvIdx === 1) {
-                    this.evals[ply].score = score;
-                    this.evals[ply].pv = pv;
-                    this.evals[ply].depth = depth;
+                    if (!this.evals[ply].score || (depth && depth >= (this.evals[ply].depth || 0))) {
+                        this.evals[ply].score = score;
+                        this.evals[ply].pv = pv;
+                        this.evals[ply].depth = depth;
+                    }
                 }
                 if (!this.evals[ply].multipv) this.evals[ply].multipv = [];
-                this.evals[ply].multipv[mpvIdx - 1] = { score, pv, depth };
+                const existing = this.evals[ply].multipv[mpvIdx - 1];
+                if (!existing || (depth && depth >= (existing.depth || 0))) {
+                    this.evals[ply].multipv[mpvIdx - 1] = { score, pv, depth };
+                }
             }
-            if (ply === this.index) this.renderEval(ply);
+            // Render eval bar khi đang search (realtime feedback)
+            if (ply === this.index && this.evals[ply] && this.evals[ply].score) {
+                this.renderEval(ply);
+            }
             return;
         }
         if (data.indexOf('bestmove') === 0) {
@@ -3808,7 +3818,16 @@ const Analysis = {
         return ch;
     },
 
-    // ===== Classification V2 (Chess.com standard, Expected Points model) =====
+    // ===== Classification V2 — Rewrite nghiêm khắc hơn =====
+    // Tham khảo: https://support.chess.com/en/articles/8572705-how-are-moves-classified
+    //
+    // Triết lý:
+    // - "Best" = nước đi KHỚP với nước tốt nhất engine đề xuất (PV[0])
+    // - Nếu không khớp PV → dùng EP loss + centipawn loss để classify
+    // - Accuracy CAPS2: 100*exp(-3*epLoss) nhưng clamp [40, 99] cho thực tế
+    //
+    // Vấn đề cũ: chỉ dùng epLoss → nhiều nước đi đều "Best" vì eval trước/sau
+    // gần giống nhau khi engine search sâu. Fix: dùng kết hợp cp loss + PV match.
     classifyMove(i) {
         const before = this.evals[i - 1];
         const after = this.evals[i];
@@ -3827,23 +3846,30 @@ const Analysis = {
         // EP loss = EP trước nước - EP sau nước (0-1, clamp >= 0)
         const epLoss = Math.max(0, epBefore - epAfter);
 
+        // Centipawn loss (từ góc nhìn player) — sensitive hơn EP loss
+        // cpBefore = bestCp (player POV), cpAfter = -afterCp (player POV after negate)
+        const cpBefore = bestCp;
+        const cpAfter = -afterCp;
+        const cpLoss = Math.max(0, cpBefore - cpAfter);
+
         const moverColor = (i - 1) % 2 === 0 ? 'w' : 'b';
         const bestSan = before.pv && before.pv[0];
         const playedSan = this.pgnMoves[i - 1];
         const isBest = !!bestSan && bestSan === playedSan;
 
         // Lưu EP để dùng cho accuracy
-        const ep = { before: epBefore, after: epAfter, loss: epLoss };
+        const ep = { before: epBefore, after: epAfter, loss: epLoss, cpLoss };
 
         // ===== Book: nước khai cuộc phổ biến (<=10 ply) =====
-        // Chess.com: Book = nước trong opening database, không cần EP judgment.
-        // Ở đây ta ước lượng: nếu <=10 ply và epLoss nhỏ (< 0.05) → Book.
-        // Nếu opening move nhưng epLoss lớn (sai nước khai cuộc) → vẫn classify thường.
-        if (i <= this.BOOK_PLY && epLoss <= 0.05 && !isBest) return { label: 'Book', delta: epLoss * 100, ep };
+        // Chess.com: Book = nước trong opening database
+        // Ở đây: <=10 ply + cpLoss < 30cp + không phải Best → Book
+        if (i <= this.BOOK_PLY && cpLoss < 30 && !isBest) {
+            return { label: 'Book', delta: epLoss * 100, ep };
+        }
 
-        // ===== Brilliant (!!): best/near-best + sacrifice + not already winning =====
-        // Chess.com: nước tốt nhất + hy sinh quân + kết quả không xấu + chưa hoàn toàn thắng trước đó
-        if (isBest && epAfter >= 0.5) { // result not bad (>= 50% win)
+        // ===== Brilliant (!!): best + sacrifice + not already winning =====
+        // Chess.com: nước tốt nhất + hy sinh quân có chủ đích + kết quả không xấu
+        if (isBest && epAfter >= 0.5) {
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
             const matLost = bal0 - bal1;
@@ -3854,8 +3880,8 @@ const Analysis = {
         }
 
         // ===== Great (!): game-changing move =====
-        // Chess.com: chuyển kết quả ván (thua→hòa, hòa→thắng) hoặc chỉ có 1 nước tốt để cứu
-        if (epLoss <= 0.02) {
+        // Chess.com: chuyển kết quả ván (thua→hòa, hòa→thắng)
+        if (epLoss <= 0.05) {
             // Lose → Draw: was losing (ep < 0.3), now draw/win (ep >= 0.5)
             if (epBefore < 0.3 && epAfter >= 0.5) return { label: 'Great', delta: epLoss * 100, ep };
             // Draw → Win: was drawish (0.3-0.6), now winning (>= 0.75)
@@ -3863,8 +3889,7 @@ const Analysis = {
         }
 
         // ===== Miss: đối thủ mắc sai lầm, bạn bỏ lỡ cơ hội =====
-        // Chess.com: nhìn nước của đối thủ trước đó — nếu đối thủ blunder,
-        // bạn có cơ hội thắng nhưng không tận dụng
+        // Chess.com: opponent blunder + bạn có cơ hội thắng nhưng không tận dụng
         if (i >= 2) {
             const oppBefore = this.evals[i - 2];
             const oppAfter = this.evals[i - 1];
@@ -3872,7 +3897,6 @@ const Analysis = {
                 const oppBestCp = this.cpOf(oppBefore.score);
                 const oppAfterCp = this.cpOf(oppAfter.score);
                 if (oppBestCp != null && oppAfterCp != null) {
-                    // Same formula: before = player POV, after = opponent POV (negate)
                     const oppEpBefore = this.expectedPoints(oppBestCp);
                     const oppEpAfter = this.expectedPoints(-oppAfterCp);
                     if (oppEpBefore != null && oppEpAfter != null) {
@@ -3887,19 +3911,32 @@ const Analysis = {
             }
         }
 
-        // ===== Classification V2 (EP loss thresholds — Chess.com spec) =====
-        // https://support.chess.com/en/articles/8572705-how-are-moves-classified
-        //   Best:       EP loss = 0.00
-        //   Excellent:  0.00 < EP loss ≤ 0.02
-        //   Good:       0.02 < EP loss ≤ 0.05
-        //   Inaccuracy: 0.05 < EP loss ≤ 0.10
-        //   Mistake:    0.10 < EP loss ≤ 0.20
-        //   Blunder:    EP loss > 0.20
-        if (epLoss < 0.001) return { label: 'Best', delta: 0, ep };
-        if (epLoss <= 0.02) return { label: 'Excellent', delta: epLoss * 100, ep };
-        if (epLoss <= 0.05) return { label: 'Good', delta: epLoss * 100, ep };
-        if (epLoss <= 0.10) return { label: 'Inaccuracy', delta: epLoss * 100, ep };
-        if (epLoss <= 0.20) return { label: 'Mistake', delta: epLoss * 100, ep };
+        // ===== Classification V2 — nghiêm khắc hơn =====
+        // Ưu tiên: nếu KHỚP PV[0] → Best (engine xác nhận là nước tốt nhất)
+        // Nếu không khớp → dùng cpLoss + epLoss để classify
+        //
+        // Thresholds (điều chỉnh thực tế hơn, tránh 100% Best):
+        //   Best:       cpLoss < 5cp AND epLoss < 0.005 (gần như perfect)
+        //   Excellent:  cpLoss < 20cp AND epLoss ≤ 0.02
+        //   Good:       cpLoss < 50cp AND epLoss ≤ 0.05
+        //   Inaccuracy: cpLoss < 100cp AND epLoss ≤ 0.10
+        //   Mistake:    cpLoss < 200cp AND epLoss ≤ 0.20
+        //   Blunder:    cpLoss >= 200cp OR epLoss > 0.20
+        if (isBest || (cpLoss < 5 && epLoss < 0.005)) {
+            return { label: 'Best', delta: 0, ep };
+        }
+        if (cpLoss < 20 && epLoss <= 0.02) {
+            return { label: 'Excellent', delta: epLoss * 100, ep };
+        }
+        if (cpLoss < 50 && epLoss <= 0.05) {
+            return { label: 'Good', delta: epLoss * 100, ep };
+        }
+        if (cpLoss < 100 && epLoss <= 0.10) {
+            return { label: 'Inaccuracy', delta: epLoss * 100, ep };
+        }
+        if (cpLoss < 200 && epLoss <= 0.20) {
+            return { label: 'Mistake', delta: epLoss * 100, ep };
+        }
         return { label: 'Blunder', delta: epLoss * 100, ep };
     },
 
@@ -4090,10 +4127,10 @@ const Analysis = {
         const container = document.getElementById('analysis-classification-stats');
         if (!container) return;
 
-        // ===== CAPS2-style Accuracy =====
+        // ===== CAPS2-style Accuracy (điều chỉnh thực tế) =====
         // Chess.com CAPS2: per-move accuracy = 100 * exp(-3 * epLoss)
         // Game accuracy = average of per-move accuracies
-        // Range: 50-95 for typical games (not clustered near 100)
+        // Clamp [35, 99] cho thực tế — tránh 100% hay 0% cực đoan
         const whiteAccuracies = [];
         const blackAccuracies = [];
         const whiteCounts = {};
@@ -4103,9 +4140,10 @@ const Analysis = {
             if (c && c.ep && c.ep.loss !== undefined) {
                 // Per-move CAPS2 accuracy
                 let acc;
-                if (c.ep.loss === 0) acc = 100;
+                if (c.ep.loss < 0.001) acc = 99;
                 else acc = 100 * Math.exp(-3 * c.ep.loss);
-                acc = Math.max(0, Math.min(100, acc));
+                // Clamp [35, 99] — typical amateur games range 50-90%
+                acc = Math.max(35, Math.min(99, acc));
 
                 if (i % 2 === 1) {
                     whiteAccuracies.push(acc);
@@ -4355,7 +4393,7 @@ const Analysis = {
             const isWhite = p.ply % 2 === 1;
             const side = isWhite ? 'Trắng' : 'Đen';
             const san = this.pgnMoves[p.ply - 1] || '?';
-            const explanation = this.labelExplanation(p.label, p.delta, p.winBefore, p.winAfter);
+            const explanation = this.labelExplanation(p.label, p.delta, p.winBefore, p.winAfter, p.ep);
             html += '<div class="review-item review-' + p.label.toLowerCase() + '">'
                 + '<div class="review-rank">#' + (rank + 1) + '</div>'
                 + '<div class="review-main">'
@@ -4400,7 +4438,7 @@ const Analysis = {
         let html = '<div class="why-move">' + moveNum + (isWhite ? '.' : '...') + ' ' + san + ' <span class="why-side">(' + side + ')</span></div>';
         if (c) {
             html += '<div class="why-label why-label-' + c.label.toLowerCase() + '">' + c.label + '</div>';
-            html += '<div class="why-explain">' + this.labelExplanation(c.label, c.delta, c.winBefore, c.winAfter) + '</div>';
+            html += '<div class="why-explain">' + this.labelExplanation(c.label, c.delta, c.winBefore, c.winAfter, c.ep) + '</div>';
         } else {
             html += '<div class="why-explain">Chưa phân tích nước này. Bấm "Bắt đầu phân tích" để có nhãn đánh giá.</div>';
         }
@@ -4422,23 +4460,28 @@ const Analysis = {
     },
 
     // ===== Giải thích nhãn phân loại (ngôn ngữ người thường) =====
-    labelExplanation(label, delta, winBefore, winAfter) {
+    labelExplanation(label, delta, winBefore, winAfter, ep, cpLoss) {
         const deltaTxt = delta != null ? delta.toFixed(1) : '?';
         const beforeTxt = winBefore != null ? winBefore.toFixed(0) : '?';
         const afterTxt = winAfter != null ? winAfter.toFixed(0) : '?';
+        const epLossTxt = ep && ep.loss != null ? (ep.loss * 100).toFixed(1) : '?';
+        const cpLossTxt = cpLoss != null ? cpLoss : (ep && ep.cpLoss != null ? ep.cpLoss : '?');
+        const epBeforeTxt = ep && ep.before != null ? (ep.before * 100).toFixed(0) : '?';
+        const epAfterTxt = ep && ep.after != null ? (ep.after * 100).toFixed(0) : '?';
+
         const explanations = {
-            Brilliant: 'Nước thiên tài! Bạn hy sinh material nhưng vẫn giữ được lợi thế hoặc giành lợi thế lớn. Engine thấy đường đi sâu mà người thường khó thấy.',
-            Great: 'Nước rất tốt — bạn cứu được ván từ thế khó, biến tình thế bất lợi thành cầm cờ hoặc thắng.',
-            Best: 'Đúng nước engine đề xuất. Bạn đã tìm ra nước đi tốt nhất trong tình huống này.',
-            Excellent: 'Nước gần tối ưu. Đánh giá rớt rất ít so với nước tốt nhất — bạn đang chơi rất chính xác.',
-            Good: 'Nước hợp lý. Có thể không phải nước tốt nhất nhưng vẫn giữ được lợi thế.',
-            Book: 'Nước theo lý thuyết khai cuộc. Đây là nước đã được nghiên cứu rộng rãi.',
-            Inaccuracy: 'Không chính xác. Bạn rớt khoảng ' + deltaTxt + '% thắng. Không nghiêm trọng nhưng có nước chính xác hơn.',
-            Mistake: 'Sai lầm. Bạn rớt ' + deltaTxt + '% thắng (từ ' + beforeTxt + '% xuống ' + afterTxt + '%). Có nước rõ ràng tốt hơn.',
-            Missed: 'Bỏ lỡ cơ hội thắng lớn. Bạn đang có ' + beforeTxt + '% thắng nhưng chọn nước không tối ưu, bỏ lỡ cơ hội quyết định.',
-            Blunder: 'Lỗi nghiêm trọng! Bạn rớt ' + deltaTxt + '% thắng (từ ' + beforeTxt + '% xuống ' + afterTxt + '%). Có thể mất material hoặc bị chiếu hết.'
+            Brilliant: 'Nước thiên tài! Bạn hy sinh material (' + cpLossTxt + 'cp) nhưng vẫn giữ được lợi thế lớn. Engine thấy đường đi sâu mà người thường khó thấy. EP: ' + epBeforeTxt + '% → ' + epAfterTxt + '%.',
+            Great: 'Nước rất tốt — bạn cứu được ván từ thế khó, biến tình thế bất lợi thành cầm cờ hoặc thắng. EP: ' + epBeforeTxt + '% → ' + epAfterTxt + '%.',
+            Best: 'Đúng nước engine đề xuất (PV[0]). Bạn đã tìm ra nước đi tốt nhất trong tình huống này.',
+            Excellent: 'Nước gần tối ưu. Rớt chỉ ' + cpLossTxt + 'cp (' + epLossTxt + '% EP). Bạn đang chơi rất chính xác.',
+            Good: 'Nước hợp lý. Rớt ' + cpLossTxt + 'cp (' + epLossTxt + '% EP) so với nước tốt nhất, nhưng vẫn giữ được lợi thế.',
+            Book: 'Nước theo lý thuyết khai cuộc. Đây là nước đã được nghiên cứu rộng rãi trong opening database.',
+            Inaccuracy: 'Không chính xác. Rớt ' + cpLossTxt + 'cp (' + epLossTxt + '% EP). Có nước chính xác hơn — cân nhắc kỹ trước khi đi.',
+            Mistake: 'Sai lầm. Rớt ' + cpLossTxt + 'cp (' + epLossTxt + '% EP, từ ' + epBeforeTxt + '% xuống ' + epAfterTxt + '% EP). Có nước rõ ràng tốt hơn.',
+            Missed: 'Bỏ lỡ cơ hội! Bạn đang có ' + epBeforeTxt + '% EP nhưng chọn nước không tối ưu. Đối thủ vừa blunder nhưng bạn không trừng phạt được.',
+            Blunder: 'Lỗi nghiêm trọng! Rớt ' + cpLossTxt + 'cp (' + epLossTxt + '% EP, từ ' + epBeforeTxt + '% xuống ' + epAfterTxt + '% EP). Có thể mất material hoặc bị chiếu hết.'
         };
-        return explanations[label] || ('Nước đi với mức rớt ' + deltaTxt + '% thắng.');
+        return explanations[label] || ('Nước đi với mức rớt ' + cpLossTxt + 'cp (' + epLossTxt + '% EP).');
     }
 };
 
