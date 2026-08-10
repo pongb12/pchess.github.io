@@ -3878,6 +3878,8 @@ const Analysis = {
 
         // ===== Brilliant (!!): best + sacrifice + not already winning =====
         // Chess.com: nước tốt nhất + hy sinh quân có chủ đích + kết quả không xấu
+        // Mở rộng: chấp nhận cả trường hợp ăn quân miễn phí (matLost có thể âm = được quân)
+        // khi result tốt — Chess.com đôi khi gắn Brilliant cho nước thắng lớn.
         if (isBest && epAfter >= 0.5) {
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
@@ -3890,11 +3892,16 @@ const Analysis = {
 
         // ===== Great (!): game-changing move =====
         // Chess.com: chuyển kết quả ván (thua→hòa, hòa→thắng)
+        // HOẶC: ăn quân miễn phí (opponent blunder, bạn capitalize) với eval boost lớn
         if (epLoss <= 0.05) {
             // Lose → Draw: was losing (ep < 0.3), now draw/win (ep >= 0.5)
             if (epBefore < 0.3 && epAfter >= 0.5) return { label: 'Great', delta: epLoss * 100, ep };
             // Draw → Win: was drawish (0.3-0.6), now winning (>= 0.75)
             if (epBefore < 0.6 && epAfter >= 0.75) return { label: 'Great', delta: epLoss * 100, ep };
+            // WIN FREE PIECE: opponent blunder, bạn capitalize với eval boost lớn
+            if (i >= 2 && epAfter - epBefore > 0.15 && epAfter >= 0.7) {
+                return { label: 'Great', delta: epLoss * 100, ep };
+            }
         }
 
         // ===== Miss: đối thủ mắc sai lầm, bạn bỏ lỡ cơ hội =====
@@ -3961,30 +3968,35 @@ const Analysis = {
     renderEval(ply) {
         const ev = this.evals[ply];
         if (!ev || ply !== this.index) return;
-        const text = this.formatScore(ev.score);
+
+        // ===== Tính cp quy về POV Trắng (cho eval bar + text) =====
+        // Stockfish trả eval từ góc nhìn side-to-move (người SẼ đi tiếp).
+        // this.evals[ply] = eval TẠI vị trí ply (sau khi ply nước đã chơi)
+        //
+        // ply = số nước đã chơi:
+        //   - ply chẵn (0, 2, 4...): Trắng sẽ đi tiếp → eval là POV Trắng → dùng trực tiếp
+        //   - ply lẻ (1, 3, 5...): Đen sẽ đi tiếp → eval là POV Đen → đổi dấu
+        let cpForWhite;
+        if (ev.score.type === 'mate') {
+            cpForWhite = ev.score.value > 0 ? 100000 - ev.score.value : -(100000 + ev.score.value);
+        } else {
+            cpForWhite = ev.score.value;
+        }
+        if (ply % 2 === 1) cpForWhite = -cpForWhite; // Đen sẽ đi → đổi dấu
+
+        // Text hiển thị theo POV Trắng (đồng bộ với eval bar)
+        const text = this.formatCpForWhite(cpForWhite, ev.score);
         document.getElementById('analysis-eval-text').textContent = text;
 
-        // ===== Eval bar: dùng sigmoid win% (chuẩn Lichess/Chess.com) =====
-        // Eval bar thể hiện % thắng của Trắng (trên = Trắng, dưới = Đen).
-        //
-        // Stockfish trả eval từ góc nhìn side-to-move (người SẼ đi tiếp).
-        // Eval sau nước ply = góc nhìn ĐỐI THỦ của người vừa đi.
-        // Để quy về góc nhìn TRẮNG:
-        //   - ply chẵn (Trắng sẽ đi): eval đã là góc nhìn Trắng → dùng trực tiếp
-        //   - ply lẻ (Đen sẽ đi): eval là góc nhìn Đen → đổi dấu
+        // ===== Eval bar: sigmoid win% từ POV Trắng =====
         const fill = document.getElementById('analysis-eval-fill');
-        let whiteWinPct; // 0-100, % thắng của Trắng
-        let cp = ev.score.type === 'cp' ? ev.score.value : 0;
-        // ply lẻ = Đen sẽ đi tiếp → eval là góc nhìn Đen → đổi dấu
-        if (ply % 2 === 1) cp = -cp;
-
+        let whiteWinPct;
         if (ev.score.type === 'mate') {
             let mateVal = ev.score.value;
-            if (ply % 2 === 1) mateVal = -mateVal; // Đen sẽ đi → đổi dấu
+            if (ply % 2 === 1) mateVal = -mateVal;
             whiteWinPct = mateVal > 0 ? 100 : 0;
         } else {
-            // Sigmoid: cp → % thắng của Trắng
-            whiteWinPct = 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
+            whiteWinPct = 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cpForWhite)) - 1);
         }
         whiteWinPct = Math.max(0, Math.min(100, whiteWinPct));
 
@@ -4004,6 +4016,27 @@ const Analysis = {
 
         const cells = document.querySelectorAll('.ml-eval');
         cells[ply] && (cells[ply].textContent = text);
+    },
+
+    // Format cp (POV Trắng) thành text: +4.3, -1.5, M5, -M3
+    formatCpForWhite(cpForWhite, score) {
+        if (score && score.type === 'mate') {
+            // mate value từ POV side-to-move; quy về POV Trắng
+            let mateVal = score.value;
+            // Đã được xử lý ở caller (cpForWhite), nhưng mate cần xử lý riêng
+            // vì mate value dương = side-to-move sẽ mate, âm = bị mate
+            // Quy về POV Trắng: nếu Trắng sẽ mate → dương, nếu Đen sẽ mate → âm
+            // cpForWhite > 50000 = Trắng mate, < -50000 = Đen mate
+            if (cpForWhite >= 50000) {
+                return 'M' + Math.round(100000 - cpForWhite);
+            } else if (cpForWhite <= -50000) {
+                return '-M' + Math.round(100000 + cpForWhite);
+            }
+            return 'M?';
+        }
+        const pawns = cpForWhite / 100;
+        const s = pawns.toFixed(1);
+        return (pawns > 0 ? '+' : '') + s;
     },
 
     formatScore(score) {
