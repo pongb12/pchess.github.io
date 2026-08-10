@@ -2798,7 +2798,7 @@ const Analysis = {
     getEngineDepth() {
         const mode = this._engineMode || this.getEngineMode();
         if (mode === 'nexus') return 12;
-        if (mode === 'nexus-high') return 35;
+        if (mode === 'nexus-high') return 30;  // hạ từ 35 → 30 (depth 35 quá lâu)
         return 18;
     },
 
@@ -3025,21 +3025,21 @@ const Analysis = {
         this.analyzeAll();
     },
 
-    // ===== analyzeCurrent (local Stockfish) =====
+    // ===== analyzeCurrent (local engine) =====
     analyzeCurrent() {
         if (!this.ready || this.index < 0 || this.index > this.pgnMoves.length) return;
         if (!this.engine) {
             this.setEngineStatus('⚠️ Engine chưa khởi tạo', true);
             return;
         }
-        // Stockfish -single crash nếu gửi position/go khi đang search → phải chờ bestmove.
+        // Engine -single crash nếu gửi position/go khi đang search → phải chờ bestmove.
         if (this.pendingPly != null) {
             this.requestPly = this.index;
             return;
         }
         this.pendingPly = this.index;
         this.requestPly = null;
-        // Stockfish cần UCI (e2e4), chuyển từ SAN
+        // Engine cần UCI (e2e4), chuyển từ SAN
         const ucis = [];
         const ch = new Chess();
         for (let i = 0; i < this.index; i++) {
@@ -3049,13 +3049,15 @@ const Analysis = {
             } catch (e) { break; }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
-        const isNexus = this._engineMode === 'nexus' || this._engineMode === 'nexus-high';
         const depth = this.getEngineDepth();
+        console.log(`[Engine] analyzeCurrent: ply=${this.index}, depth=${depth}, cmd=${cmd.substring(0, 50)}...`);
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth ' + depth);
-        if (isNexus) this.engine.postMessage('quit'); // Nexus needs quit to end UCI loop
+        // KHÔNG gửi 'quit' — Nexus đã được fix (commit 78f32aa) để UCILoop return
+        // khi buffer rỗng, không cần quit. Quit hack cũ gây gián đoạn search và
+        // làm MultiPV/Eval output không đầy đủ.
         const _bm = document.getElementById('analysis-bestmove');
-        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
+        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + ' (depth ' + depth + ')...</span>';
     },
 
     // ===== Local engine message handler =====
@@ -3666,13 +3668,13 @@ const Analysis = {
             }
         }
         const cmd = 'position startpos' + (ucis.length ? ' moves ' + ucis.join(' ') : '');
-        const isNexus2 = this._engineMode === 'nexus' || this._engineMode === 'nexus-high';
         const depth2 = this.getEngineDepth();
+        console.log(`[Engine] analyzeCurrent(2): ply=${this.index}, depth=${depth2}`);
         this.engine.postMessage(cmd);
         this.engine.postMessage('go depth ' + depth2);
-        if (isNexus2) this.engine.postMessage('quit');
+        // KHÔNG gửi 'quit' — Nexus đã được fix để UCILoop return khi buffer rỗng
         const _bm = document.getElementById('analysis-bestmove');
-        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + '...</span>';
+        if (_bm) _bm.innerHTML = '<span class="bestmove-loading">🔄 Đang phân tích ply ' + this.index + '/' + this.pgnMoves.length + ' (depth ' + depth2 + ')...</span>';
     },
 
     // ===== Phân tích toàn bộ ván (chạy tuần tự từng vị trí) =====
@@ -3833,8 +3835,11 @@ const Analysis = {
         // Lưu EP để dùng cho accuracy
         const ep = { before: epBefore, after: epAfter, loss: epLoss };
 
-        // ===== Book: nước khai cuộc (<=10 ply) =====
-        if (i <= this.BOOK_PLY && epLoss <= 0.05) return { label: 'Book', delta: epLoss * 100, ep };
+        // ===== Book: nước khai cuộc phổ biến (<=10 ply) =====
+        // Chess.com: Book = nước trong opening database, không cần EP judgment.
+        // Ở đây ta ước lượng: nếu <=10 ply và epLoss nhỏ (< 0.05) → Book.
+        // Nếu opening move nhưng epLoss lớn (sai nước khai cuộc) → vẫn classify thường.
+        if (i <= this.BOOK_PLY && epLoss <= 0.05 && !isBest) return { label: 'Book', delta: epLoss * 100, ep };
 
         // ===== Brilliant (!!): best/near-best + sacrifice + not already winning =====
         // Chess.com: nước tốt nhất + hy sinh quân + kết quả không xấu + chưa hoàn toàn thắng trước đó
@@ -3882,8 +3887,15 @@ const Analysis = {
             }
         }
 
-        // ===== Classification V2 (EP loss thresholds) =====
-        if (epLoss === 0) return { label: 'Best', delta: 0, ep };
+        // ===== Classification V2 (EP loss thresholds — Chess.com spec) =====
+        // https://support.chess.com/en/articles/8572705-how-are-moves-classified
+        //   Best:       EP loss = 0.00
+        //   Excellent:  0.00 < EP loss ≤ 0.02
+        //   Good:       0.02 < EP loss ≤ 0.05
+        //   Inaccuracy: 0.05 < EP loss ≤ 0.10
+        //   Mistake:    0.10 < EP loss ≤ 0.20
+        //   Blunder:    EP loss > 0.20
+        if (epLoss < 0.001) return { label: 'Best', delta: 0, ep };
         if (epLoss <= 0.02) return { label: 'Excellent', delta: epLoss * 100, ep };
         if (epLoss <= 0.05) return { label: 'Good', delta: epLoss * 100, ep };
         if (epLoss <= 0.10) return { label: 'Inaccuracy', delta: epLoss * 100, ep };
