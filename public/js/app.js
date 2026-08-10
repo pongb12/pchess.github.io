@@ -3838,6 +3838,9 @@ const Analysis = {
     // Vấn đề cũ: chỉ dùng epLoss → nhiều nước đi đều "Best" vì eval trước/sau
     // gần giống nhau khi engine search sâu. Fix: dùng kết hợp cp loss + PV match.
     classifyMove(i) {
+        // Material values for sacrifice detection
+        const PIECE_VAL = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+
         const before = this.evals[i - 1];
         const after = this.evals[i];
         if (!before || !after || !before.score || !after.score) return null;
@@ -3876,16 +3879,47 @@ const Analysis = {
             return { label: 'Book', delta: epLoss * 100, ep };
         }
 
-        // ===== Brilliant (!!): best + sacrifice + not already winning =====
-        // Chess.com: nước tốt nhất + hy sinh quân có chủ đích + kết quả không xấu
-        // Mở rộng: chấp nhận cả trường hợp ăn quân miễn phí (matLost có thể âm = được quân)
-        // khi result tốt — Chess.com đôi khi gắn Brilliant cho nước thắng lớn.
+        // ===== Brilliant (!!): best + sacrifice offer + not already winning =====
+        // Chess.com: nước tốt nhất + hy sinh quân CÓ CHỦ ĐÍCH + kết quả không xấu
+        //
+        // Sacrifice detection 2 cách:
+        // 1. Material thực sự mất (so sánh trước/sau nước đi + nước đối thủ)
+        // 2. Sacrifice "offer" — sau nước đi, opponent CÓ THỂ ăn quân của player
+        //    (capture available) nhưng nếu ăn sẽ bị compensation. Đây là cách
+        //    Chess.com detect Brilliant: Ra7 đặt Rook vào nơi Đen có thể Rxa7,
+        //    nhưng nếu ăn → Bf7+ e8=Q (compensation).
         if (isBest && epAfter >= 0.5) {
             const bal0 = this.materialBalance(this.buildAt(i - 1), moverColor);
             const bal1 = this.materialBalance(this.buildAt(i), moverColor);
-            const matLost = bal0 - bal1;
-            // Sacrifice >= 1.5 pawns + wasn't already completely winning (epBefore < 0.95)
-            if (matLost >= 1.5 && epBefore < 0.95 && epAfter >= 0.6) {
+            let matLost = bal0 - bal1;
+
+            // Cách 1: kiểm tra material mất ở ply i+1 (sau nước đối thủ)
+            if (matLost < 1.5 && this.evals[i + 1]) {
+                const bal2 = this.materialBalance(this.buildAt(i + 1), moverColor);
+                const matLostNext = bal0 - bal2;
+                if (matLostNext > matLost) matLost = matLostNext;
+            }
+
+            // Cách 2: sacrifice offer — kiểm tra xem sau nước đi, opponent có thể
+            // ăn quân nào của player không (capture available)
+            let sacrificeOffer = false;
+            if (matLost < 1.5) {
+                try {
+                    const chAfter = this.buildAt(i);
+                    const oppMoves = chAfter.moves({ verbose: true });
+                    // Tìm capture move — opponent có thể ăn quân player
+                    const captures = oppMoves.filter(m => m.captured);
+                    if (captures.length > 0) {
+                        // Tính giá trị quân bị đe dọa (chỉ quân player vừa đặt vào vị trí nguy hiểm)
+                        // Hoặc bất kỳ quân nào có giá trị >= 3 (minor/major piece)
+                        const threatenedVal = Math.max(...captures.map(c => PIECE_VAL[c.captured] || 1));
+                        if (threatenedVal >= 3) sacrificeOffer = true;
+                    }
+                } catch (e) { /* ignore */ }
+            }
+
+            // Brilliant nếu: sacrifice (material lost OR offer) + not already winning
+            if ((matLost >= 1.5 || sacrificeOffer) && epBefore < 0.95 && epAfter >= 0.6) {
                 return { label: 'Brilliant', delta: epLoss * 100, ep };
             }
         }
