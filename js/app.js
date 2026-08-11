@@ -2798,16 +2798,16 @@ const Analysis = {
     getEngineDepth() {
         const mode = this._engineMode || this.getEngineMode();
         const ply = this.index || 0;
-        // Nexus web-analysis (pthreads): Low 14-18, High 22-26
-        if (mode === 'nexus-web') {
-            if (ply <= 12) return 18;
-            if (ply <= 30) return 16;
-            return 14;
-        }
+        // Nexus web-analysis (pthreads build):
+        // - Low: depth 12 cố định (best moves đúng, nhanh 150-400ms)
+        // - High: depth 17-19 adaptive (17 opening, 18 middle, 19 endgame)
+        //   depth 17 = best moves đúng, 3-8s
+        //   depth 19 = engine bắt đầu yếu ở startpos nhưng OK ở middle/endgame
+        if (mode === 'nexus-web') return 12;
         if (mode === 'nexus-web-high') {
-            if (ply <= 12) return 26;
-            if (ply <= 30) return 24;
-            return 22;
+            if (ply <= 12) return 17;   // opening: depth 17 an toàn
+            if (ply <= 30) return 18;   // middle: depth 18 OK
+            return 19;                   // endgame: depth 19 OK (position đơn giản)
         }
         // Nexus single-threaded (old): Low 12, High 30
         if (mode === 'nexus') return 12;
